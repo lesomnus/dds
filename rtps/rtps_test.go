@@ -147,6 +147,11 @@ func FuzzParse(f *testing.F) {
 	for _, n := range []string{"spdp-talker.rtps", "spdp-composition.rtps", "spdp-dispose-talker.rtps"} {
 		f.Add(fixture(f, n))
 	}
+	for i, d := range capture(f) {
+		if i%8 == 0 { // a sample of everything Cyclone sent: SEDP, HEARTBEAT, ACKNACK, GAP, user data
+			f.Add(d.Data)
+		}
+	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		m, _ := rtps.Parse(b)
 		for _, s := range m.Submessages {
@@ -161,7 +166,21 @@ func FuzzParse(f *testing.F) {
 					if pl, err := rtps.ReadParameterListPayload(d.Payload); err == nil {
 						_, _ = rtps.ParseParticipantData(pl, m.Header.Vendor)
 						_, _ = rtps.ParseParticipantData(pl, rtps.VendorCyclone)
+						_, _ = rtps.ParseEndpointData(rtps.Writer, pl)
+						_, _ = rtps.ParseEndpointData(rtps.Reader, pl)
 					}
+				}
+			case rtps.SubDataFrag:
+				_, _ = rtps.ParseDataFrag(s)
+			case rtps.SubHeartbeat:
+				_, _ = rtps.ParseHeartbeat(s)
+			case rtps.SubAckNack:
+				if a, err := rtps.ParseAckNack(s); err == nil {
+					_ = a.State.Members()
+				}
+			case rtps.SubGap:
+				if g, err := rtps.ParseGap(s); err == nil {
+					_ = g.Irrelevant(g.Start)
 				}
 			case rtps.SubInfoTS:
 				_, _ = rtps.ParseInfoTS(s)
