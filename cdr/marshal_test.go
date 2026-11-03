@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/lesomnus/cdr"
+	"github.com/lesomnus/dds/cdr"
 )
 
 func TestMarshal(t *testing.T) {

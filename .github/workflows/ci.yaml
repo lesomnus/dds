@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./... && go vet -tags e2e ./e2e/
+      - run: go test -race -count=1 ./...
+      # A short run over the seed corpus and a little beyond it, on every
+      # change: a decoder that panics on a packet is a crash on a robot.
+      - run: go test -run '^$' -fuzz FuzzParse -fuzztime 30s ./rtps/
+
+  e2e:
+    # Against Cyclone DDS 0.10.x as ROS 2 Jazzy runs it (rmw_cyclonedds_cpp).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: docker build -t dds-e2e-ros:jazzy e2e/image
+      - run: go test -tags e2e -count=1 -v ./e2e/

@@ -1,6 +1,6 @@
 package cdr_test
 
-import "github.com/lesomnus/cdr/ros"
+import "github.com/lesomnus/dds/cdr/ros"
 
 var dataset = []struct {
 	desc  string
