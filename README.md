@@ -159,7 +159,9 @@ state, and each writer's traffic as metrics.
 | | |
 |---|---|
 | [`rtps`](rtps) | messages, submessages, parameter lists; SPDP and SEDP data; writing messages |
-| [`transport`](transport) | the RTPS port mapping, multicast listening, interfaces |
+| [`transport`](transport) | the `Transport` interface a participant sends and receives through; the RTPS port mapping; pacing (`Paced`) |
+| [`transport/udp`](transport/udp) | the UDPv4 transport: one interface or several, ephemeral or well-known ports, SPDP multicast |
+| [`transport/memtest`](transport/memtest) | a network in memory with loss and duplication, for testing participants without sockets |
 | [`discovery`](discovery) | participants (SPDP) and endpoints (SEDP), with events |
 | [`participant`](participant) | the participant: discovery on this host, reliable readers and writers, subscriptions and publications |
 | [`ros2`](ros2) | `ros_discovery_info`, the node graph, ROS names of DDS topics and types |
@@ -177,8 +179,14 @@ state, and each writer's traffic as metrics.
 - Endpoints match on topic, type, reliability and durability. Other QoS
   (deadline, lifespan, ownership, partitions, ...) is reported, not enforced.
 - Topics are keyless: no keys, instances, dispose or unregister of samples.
-- IPv4 and one interface. `ScopeNetwork` stays on the link (multicast TTL 1)
-  and reaches no routed network. A participant's own writers and readers do
+- IPv4 only, over UDP. TCP would be another `transport.Transport`; none is
+  written. `ScopeNetwork` stays on the link (multicast TTL 1) and reaches no
+  routed network.
+- Several interfaces are used together (`Config.Interfaces`, in order of
+  preference). Each hears an announcement listing only its own locator,
+  because a peer may send to every locator it is told of, reachable or not.
+  A peer reachable on several interfaces is sent to on the first. Interfaces
+  are fixed when the participant starts. A participant's own writers and readers do
   not meet: it does not discover itself.
 - A writer does not wait. `Write` returns at once, and a full KEEP_ALL history
   is an error rather than a block. There is no flow control.

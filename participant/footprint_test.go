@@ -47,7 +47,7 @@ func TestEndpointFootprint(t *testing.T) {
 	const n = 2000
 	p := testParticipant()
 	part := rtps.GUIDPrefix{1, 2, 3}
-	pe := &peer{data: discovery.Participant{ParticipantData: rtps.ParticipantData{GUID: rtps.GUID{Prefix: part}}}, proxies: map[rtps.GUID]*writerProxy{}}
+	pe := &peer{data: discovery.Participant{ParticipantData: rtps.ParticipantData{GUID: rtps.GUID{Prefix: part}}}, proxies: map[proxyKey]*writerProxy{}}
 	p.peers[part] = pe
 	heap := func() uint64 {
 		runtime.GC()
@@ -81,7 +81,7 @@ func TestEndpointFootprint(t *testing.T) {
 func BenchmarkSEDPIngest(b *testing.B) {
 	p := testParticipant()
 	part := rtps.GUIDPrefix{1, 2, 3}
-	pe := &peer{data: discovery.Participant{ParticipantData: rtps.ParticipantData{GUID: rtps.GUID{Prefix: part}}}, proxies: map[rtps.GUID]*writerProxy{}}
+	pe := &peer{data: discovery.Participant{ParticipantData: rtps.ParticipantData{GUID: rtps.GUID{Prefix: part}}}, proxies: map[proxyKey]*writerProxy{}}
 	p.peers[part] = pe
 	samples := make([]Sample, 4096)
 	for i := range samples {

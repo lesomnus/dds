@@ -33,7 +33,7 @@ import (
 
 	"github.com/lesomnus/dds/participant"
 	"github.com/lesomnus/dds/rtps"
-	"github.com/lesomnus/dds/transport"
+	"github.com/lesomnus/dds/transport/udp"
 )
 
 func usage() {
@@ -70,7 +70,7 @@ func main() {
 	mode := os.Args[1]
 	fs := flag.NewFlagSet(mode, flag.ExitOnError)
 	domain := fs.Uint("domain", 0, "DDS domain ID")
-	iface := fs.String("iface", "", "interface, by an address prefix it has (e.g. 192.168.10.0/24)")
+	iface := fs.String("iface", "", "interfaces, by an address prefix each has, comma-separated in order of preference (e.g. 192.168.10.0/24,10.0.0.0/16)")
 	topic := fs.String("topic", "", "topic name")
 	typ := fs.String("type", "", "type name")
 	reliability := fs.String("reliability", "reliable", "reliable or best_effort")
@@ -95,13 +95,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	prefix, err := netip.ParsePrefix(*iface)
+	ifs, err := udp.ParseInterfaces(*iface)
 	if err != nil {
 		log.Fatalf("-iface: %v", err)
-	}
-	ifi, addr, err := transport.InterfaceByAddr(prefix)
-	if err != nil {
-		log.Fatal(err)
 	}
 	sc := map[string]participant.Scope{"host": participant.ScopeHost, "network": participant.ScopeNetwork}
 	s, ok := sc[*scope]
@@ -109,7 +105,7 @@ func main() {
 		log.Fatalf("-scope %q", *scope)
 	}
 	p, err := participant.New(participant.Config{
-		Domain: uint32(*domain), Interface: ifi, Addr: addr, Name: "ddscat",
+		Domain: uint32(*domain), Interfaces: ifs, Name: "ddscat",
 		Scope: s, Peers: peers, NoMulticast: *noMulticast, MaxSendRate: *sendRate,
 	}, nil)
 	if err != nil {
@@ -126,7 +122,7 @@ func main() {
 	run, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { done <- p.Run(run) }()
-	log.Printf("participant %s at %s, scope %s, participant index %d", p.GUIDPrefix(), p.Addr(), s, p.ParticipantIndex())
+	log.Printf("participant %s at %v, scope %s, participant index %d", p.GUIDPrefix(), p.Locators(), s, p.ParticipantIndex())
 
 	switch mode {
 	case "sub":

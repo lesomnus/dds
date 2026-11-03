@@ -16,7 +16,7 @@ import (
 const module = "github.com/lesomnus/dds"
 
 // core is DDS: none of it may import, however indirectly, what is ROS's.
-var core = []string{"rtps", "discovery", "participant", "transport", "traffic", "cdr", "internal/pcap"}
+var core = []string{"rtps", "discovery", "participant", "transport", "transport/udp", "transport/memtest", "traffic", "cdr", "internal/pcap"}
 
 var ros = []string{"ros2", "cdr/ros"}
 

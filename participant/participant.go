@@ -30,15 +30,22 @@ import (
 	"github.com/lesomnus/dds/discovery"
 	"github.com/lesomnus/dds/rtps"
 	"github.com/lesomnus/dds/transport"
+	"github.com/lesomnus/dds/transport/udp"
 )
 
 // Config configures a Participant.
 type Config struct {
 	Domain uint32
 	// Interface is the network interface DDS runs on, and Addr its address
-	// the participant listens on for unicast.
-	Interface *net.Interface
-	Addr      netip.Addr
+	// the participant listens on for unicast: one interface. Interfaces are
+	// several, in order of preference: a participant reachable on more than
+	// one is sent to on the first.
+	Interface  *net.Interface
+	Addr       netip.Addr
+	Interfaces []udp.Interface
+	// Transports replace the UDP transport the interfaces would make: a
+	// test's network in memory (transport/memtest), say.
+	Transports []transport.Transport
 
 	// Scope is who it talks to: by default (ScopeHost) only the
 	// participants on this host.
@@ -93,15 +100,12 @@ type Participant struct {
 	log    *slog.Logger
 	events func(discovery.Event)
 
-	conn      *net.UDPConn
-	mcast     *transport.MulticastListener
-	addr      netip.AddrPort
-	local     map[netip.Addr]bool
-	nets      []netip.Prefix // the DDS interface's subnets
-	peerAddrs map[netip.Addr]bool
-	index     int // participant index of the port; -1: none
-	pacer     *pacer
-	spdp      *discovery.SPDPObserver
+	transports []transport.Transport
+	unicast    []rtps.Locator // where we receive, as we announce it
+	local      map[netip.Addr]bool
+	nets       []netip.Prefix // the subnets the transports reach, in order of preference
+	peerAddrs  map[netip.Addr]bool
+	spdp       *discovery.SPDPObserver
 
 	mu        sync.Mutex
 	peers     map[rtps.GUIDPrefix]*peer
@@ -120,8 +124,9 @@ type peer struct {
 	// metatraffic is where its discovery traffic goes: its metatraffic
 	// unicast locators that are addresses of this host.
 	metatraffic []netip.AddrPort
-	// proxies are our readers' views of its writers, by writer.
-	proxies map[rtps.GUID]*writerProxy
+	// proxies are our readers' views of its writers: one for each pair of
+	// our reader and its writer.
+	proxies map[proxyKey]*writerProxy
 	// announced: we have told it of ourselves at least once.
 	announced bool
 }
@@ -131,7 +136,10 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 	if err := transport.CheckDomain(cfg.Domain); err != nil {
 		return nil, err
 	}
-	if cfg.Interface == nil || !cfg.Addr.IsValid() {
+	if cfg.Interface != nil && cfg.Addr.IsValid() {
+		cfg.Interfaces = append([]udp.Interface{{Interface: cfg.Interface, Addr: cfg.Addr}}, cfg.Interfaces...)
+	}
+	if len(cfg.Interfaces) == 0 && len(cfg.Transports) == 0 {
 		return nil, errors.New("participant: an interface and its address are required")
 	}
 	if cfg.LeaseDuration <= 0 {
@@ -170,9 +178,40 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 	if cfg.FragmentSize > cfg.MaxMessageSize-messageOverhead || cfg.FragmentSize < 64 {
 		return nil, fmt.Errorf("participant: a fragment size of %d for messages of %d", cfg.FragmentSize, cfg.MaxMessageSize)
 	}
-	local, err := transport.LocalAddrs()
-	if err != nil {
-		return nil, err
+	transports := cfg.Transports
+	if len(transports) == 0 {
+		ports := cfg.Ports
+		if ports == PortsDefault {
+			ports = PortsEphemeral
+			if cfg.Scope == ScopeNetwork {
+				ports = PortsWellKnown
+			}
+		}
+		t, err := udp.Open(udp.Config{
+			Domain:         cfg.Domain,
+			Interfaces:     cfg.Interfaces,
+			WellKnownPorts: ports == PortsWellKnown,
+			SendMulticast:  cfg.Scope == ScopeNetwork && !cfg.NoMulticast,
+		})
+		if err != nil {
+			return nil, err
+		}
+		transports = []transport.Transport{t}
+	}
+	if cfg.MaxSendRate > 0 {
+		for i, t := range transports {
+			transports[i] = transport.NewPaced(t, cfg.MaxSendRate, 4*cfg.MaxMessageSize)
+		}
+	}
+	local := map[netip.Addr]bool{}
+	var nets []netip.Prefix
+	var unicast []rtps.Locator
+	for _, t := range transports {
+		for _, a := range t.LocalAddrs() {
+			local[a] = true
+		}
+		nets = append(nets, t.Networks()...)
+		unicast = append(unicast, t.Unicast()...)
 	}
 	if cfg.Filter == nil {
 		if cfg.Scope == ScopeHost {
@@ -183,23 +222,26 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 	}
 
 	p := &Participant{
-		cfg:       cfg,
-		log:       cfg.Logger,
-		events:    events,
-		local:     local,
-		peers:     map[rtps.GUIDPrefix]*peer{},
-		endpoints: map[rtps.GUID]*discovery.Endpoint{},
-		readers:   map[rtps.EntityID]*userReader{},
-		writers:   map[rtps.EntityID]*Writer{},
-		sent:      map[netip.AddrPort]int64{},
-		nextKey:   1,
-		nets:      interfaceNets(cfg.Interface),
-		peerAddrs: map[netip.Addr]bool{},
+		cfg:        cfg,
+		log:        cfg.Logger,
+		events:     events,
+		local:      local,
+		peers:      map[rtps.GUIDPrefix]*peer{},
+		endpoints:  map[rtps.GUID]*discovery.Endpoint{},
+		readers:    map[rtps.EntityID]*userReader{},
+		writers:    map[rtps.EntityID]*Writer{},
+		sent:       map[netip.AddrPort]int64{},
+		nextKey:    1,
+		transports: transports,
+		unicast:    unicast,
+		nets:       nets,
+		peerAddrs:  map[netip.Addr]bool{},
 	}
 	for _, a := range cfg.Peers {
 		p.peerAddrs[a.Unmap()] = true
 	}
 	if _, err := rand.Read(p.prefix[:]); err != nil {
+		p.closeTransports()
 		return nil, err
 	}
 	sedp := p.writerConfig(writerConfig{reliable: true, transientLocal: true, keyed: true})
@@ -208,30 +250,6 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 	sedp.id = rtps.EntitySEDPSubscriptionsWriter
 	p.subsW = newStateWriter(p.prefix, sedp)
 
-	conn, err := p.listen()
-	if err != nil {
-		return nil, err
-	}
-	_ = conn.SetReadBuffer(4 << 20)
-	p.conn = conn
-	if cfg.Scope == ScopeNetwork && !cfg.NoMulticast {
-		if err := p.setMulticast(); err != nil {
-			conn.Close()
-			return nil, err
-		}
-	}
-	if cfg.MaxSendRate > 0 {
-		p.pacer = newPacer(cfg.MaxSendRate, 4*cfg.MaxMessageSize, p.write)
-	}
-	p.addr = conn.LocalAddr().(*net.UDPAddr).AddrPort()
-	p.addr = netip.AddrPortFrom(p.addr.Addr().Unmap(), p.addr.Port())
-
-	mcast, err := transport.ListenMulticast(cfg.Interface, transport.DefaultMulticastGroup, transport.SPDPMulticastPort(cfg.Domain))
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	p.mcast = mcast
 	filter := cfg.Filter
 	p.spdp = discovery.NewSPDPObserver(discovery.SPDPConfig{
 		Domain: cfg.Domain,
@@ -245,8 +263,34 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 // GUIDPrefix is the participant's own.
 func (p *Participant) GUIDPrefix() rtps.GUIDPrefix { return p.prefix }
 
-// Addr is where it receives unicast, and sends from.
-func (p *Participant) Addr() netip.AddrPort { return p.addr }
+// Addr is where it receives unicast (the first of its addresses), and sends
+// from.
+func (p *Participant) Addr() netip.AddrPort {
+	for _, l := range p.unicast {
+		if a, ok := transport.AddrPort(l); ok {
+			return a
+		}
+	}
+	return netip.AddrPort{}
+}
+
+// Locators are where it receives unicast, as it announces them.
+func (p *Participant) Locators() []rtps.Locator { return append([]rtps.Locator(nil), p.unicast...) }
+
+func (p *Participant) closeTransports() {
+	for _, t := range p.transports {
+		_ = t.Close()
+	}
+}
+
+// deliver takes what a transport received.
+func (p *Participant) deliver(pk transport.Packet) {
+	if pk.Multicast {
+		p.spdp.Handle(pk.From, pk.Data)
+		return
+	}
+	p.handleUnicast(pk.From, pk.Data)
+}
 
 // Participants returns the remote participants known now.
 func (p *Participant) Participants() []discovery.Participant { return p.spdp.Participants() }
@@ -279,27 +323,21 @@ func (p *Participant) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
+	errs := make(chan error, len(p.transports))
 
-	if p.pacer != nil {
+	for _, t := range p.transports {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p.pacer.run(ctx)
+			if err := t.Run(ctx, p.deliver); err != nil {
+				errs <- err
+			}
 		}()
 	}
 	// Announce ourselves at once to whoever the scope lets us find.
-	p.send(p.spdpTargets(), p.spdpMessage())
+	p.sendSPDP(p.spdpTargets())
 
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		errs <- p.mcast.Receive(ctx, func(pk transport.Packet) { p.spdp.Handle(pk.From, pk.Data) })
-	}()
-	go func() {
-		defer wg.Done()
-		errs <- p.receiveUnicast(ctx)
-	}()
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		p.tick(ctx)
@@ -310,30 +348,16 @@ func (p *Participant) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	case err = <-errs:
 	}
-	p.sayGoodbye()
 	cancel()
-	_ = p.conn.Close()
 	wg.Wait()
+	// The transports stopped receiving, and send still: say goodbye, then
+	// close them.
+	p.sayGoodbye()
+	p.closeTransports()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil
-}
-
-func (p *Participant) receiveUnicast(ctx context.Context) error {
-	stop := context.AfterFunc(ctx, func() { _ = p.conn.Close() })
-	defer stop()
-	buf := make([]byte, 65507)
-	for {
-		n, from, err := p.conn.ReadFromUDPAddrPort(buf)
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return err
-		}
-		p.handleUnicast(netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), buf[:n])
-	}
 }
 
 func (p *Participant) tick(ctx context.Context) {
@@ -411,36 +435,54 @@ func (p *Participant) addPeer(d discovery.Participant) *peer {
 		p.log.Debug("participant has no metatraffic address in scope; not talking to it", "guid", d.GUID.Prefix, "scope", p.cfg.Scope)
 		return nil
 	}
-	pe := &peer{data: d, metatraffic: meta, proxies: map[rtps.GUID]*writerProxy{}}
+	pe := &peer{data: d, metatraffic: meta, proxies: map[proxyKey]*writerProxy{}}
 	p.peers[d.GUID.Prefix] = pe
 	return pe
 }
 
-// send writes a message to every address the scope allows. It is the one
-// place datagrams leave.
+// send writes a message to every address the scope allows, through the
+// first transport that reaches it.
 func (p *Participant) send(to []netip.AddrPort, b []byte) {
 	for _, a := range to {
-		if !p.allowed(a.Addr()) {
-			p.log.Error("refusing to send out of scope", "to", a, "scope", p.cfg.Scope)
-			continue
-		}
-		if p.pacer != nil {
-			p.pacer.enqueue(a, b)
-			continue
-		}
-		p.write(a, b)
+		p.sendVia(rtps.Locator{}, a, b)
 	}
 }
 
-// write sends one datagram, now.
-func (p *Participant) write(a netip.AddrPort, b []byte) {
-	if _, err := p.conn.WriteToUDPAddrPort(b, a); err != nil {
-		p.log.Debug("send", "to", a, "err", err)
-		return
+// sendVia writes a message to an address the scope allows, multicasting
+// only out of the interface of one of our locators if via is one and the
+// transport can. It is the one place messages leave.
+func (p *Participant) sendVia(via rtps.Locator, a netip.AddrPort, b []byte) {
+	{
+		if !p.allowed(a.Addr()) {
+			p.log.Error("refusing to send out of scope", "to", a, "scope", p.cfg.Scope)
+			return
+		}
+		l := transport.UDPv4(a)
+		var t transport.Transport
+		for _, c := range p.transports {
+			if c.Reaches(l) {
+				t = c
+				break
+			}
+		}
+		if t == nil {
+			p.log.Debug("no transport reaches", "to", a)
+			return
+		}
+		var err error
+		if vt, ok := t.(transport.Via); ok && via.Kind != 0 {
+			err = vt.SendVia(via, l, b)
+		} else {
+			err = t.Send(l, b)
+		}
+		if err != nil {
+			p.log.Debug("send", "to", a, "err", err)
+			return
+		}
+		p.mu.Lock()
+		p.sent[a]++
+		p.mu.Unlock()
 	}
-	p.mu.Lock()
-	p.sent[a]++
-	p.mu.Unlock()
 }
 
 func (p *Participant) emit(e discovery.Event) {
@@ -456,19 +498,36 @@ func (p *Participant) builtinEndpoints() uint32 {
 		rtps.BuiltinPublicationsAnnouncer | rtps.BuiltinSubscriptionsAnnouncer
 }
 
-// spdpPayload is what we announce of ourselves.
-func (p *Participant) spdpPayload() []byte {
-	loc := rtps.Locator{Kind: rtps.LocatorUDPv4, Port: uint32(p.addr.Port()), Addr: p.addr.Addr()}
+// spdpPayload is what we announce of ourselves: our locator at an address
+// (one of ours) alone, or every one if it is none of ours.
+func (p *Participant) spdpPayload(only netip.Addr) []byte {
 	host, _ := os.Hostname()
 	exe, _ := os.Executable()
-	return (&rtps.ParameterListWriter{}).
+	pl := (&rtps.ParameterListWriter{}).
 		GUID(rtps.PIDParticipantGUID, rtps.GUID{Prefix: p.prefix, Entity: rtps.EntityParticipant}).
 		Raw(rtps.PIDProtocolVersion, []byte{2, 1}).
 		Raw(rtps.PIDVendorID, VendorID[:]).
 		Uint32(rtps.PIDDomainID, p.cfg.Domain).
-		Duration(rtps.PIDParticipantLease, p.cfg.LeaseDuration).
-		Locator(rtps.PIDMetatrafficUnicastLoc, loc).
-		Locator(rtps.PIDDefaultUnicastLoc, loc).
+		Duration(rtps.PIDParticipantLease, p.cfg.LeaseDuration)
+	// One socket for both: discovery and user traffic. A peer may send to
+	// every locator we list, reachable or not (Cyclone DDS does): it is told
+	// of the one on the interface that reaches it, as if we had no other.
+	var ls []rtps.Locator
+	for _, l := range p.unicast {
+		if l.Addr == only {
+			ls = append(ls, l)
+		}
+	}
+	if len(ls) == 0 {
+		ls = p.unicast
+	}
+	for _, l := range ls {
+		pl.Locator(rtps.PIDMetatrafficUnicastLoc, l)
+	}
+	for _, l := range ls {
+		pl.Locator(rtps.PIDDefaultUnicastLoc, l)
+	}
+	return pl.
 		Uint32(rtps.PIDBuiltinEndpointSet, p.builtinEndpoints()).
 		String(rtps.PIDEntityName, p.cfg.Name).
 		Properties(
@@ -479,16 +538,47 @@ func (p *Participant) spdpPayload() []byte {
 		Payload()
 }
 
-func (p *Participant) spdpMessage() []byte {
+func (p *Participant) spdpMessage(only netip.Addr) []byte {
 	return rtps.NewBuilder(p.prefix, VendorID).
 		InfoTS(p.cfg.Now()).
-		Data(rtps.EntitySPDPReader, rtps.EntitySPDPWriter, 1, nil, p.spdpPayload(), false).
+		Data(rtps.EntitySPDPReader, rtps.EntitySPDPWriter, 1, nil, p.spdpPayload(only), false).
 		Bytes()
+}
+
+// ourAddrFor is our address on the network of an address: the one a
+// message to it goes out of. Zero if none of ours is.
+func (p *Participant) ourAddrFor(dst netip.Addr) netip.Addr {
+	for _, n := range p.nets {
+		if !n.Contains(dst) {
+			continue
+		}
+		for _, l := range p.unicast {
+			if n.Contains(l.Addr) {
+				return l.Addr
+			}
+		}
+	}
+	return netip.Addr{}
+}
+
+// sendSPDP announces us to each address: to a unicast one with our locator
+// on its network; to the multicast group out of each interface, with that
+// interface's locator.
+func (p *Participant) sendSPDP(to []netip.AddrPort) {
+	for _, a := range to {
+		if !a.Addr().IsMulticast() {
+			p.send([]netip.AddrPort{a}, p.spdpMessage(p.ourAddrFor(a.Addr())))
+			continue
+		}
+		for _, l := range p.unicast {
+			p.sendVia(l, a, p.spdpMessage(l.Addr))
+		}
+	}
 }
 
 // announce sends our SPDP to one peer.
 func (p *Participant) announce(pe *peer) {
-	p.send(pe.metatraffic, p.spdpMessage())
+	p.sendSPDP(pe.metatraffic)
 	p.mu.Lock()
 	pe.announced = true
 	p.mu.Unlock()
@@ -497,16 +587,15 @@ func (p *Participant) announce(pe *peer) {
 // announceAll renews our lease with every peer, and nudges the writers that
 // have not started talking to us.
 func (p *Participant) announceAll() {
-	msg := p.spdpMessage()
 	p.mu.Lock()
 	peers := make([]*peer, 0, len(p.peers))
 	for _, pe := range p.peers {
 		peers = append(peers, pe)
 	}
 	p.mu.Unlock()
-	p.send(p.spdpTargets(), msg)
+	p.sendSPDP(p.spdpTargets())
 	for _, pe := range peers {
-		p.send(pe.metatraffic, msg)
+		p.sendSPDP(pe.metatraffic)
 		p.greet(pe)
 	}
 }
@@ -530,12 +619,7 @@ func (p *Participant) sayGoodbye() {
 		to = append(to, pe.metatraffic...)
 	}
 	p.mu.Unlock()
-	// Not through the send queue: it stops with Run.
-	for _, a := range append(to, p.spdpTargets()...) {
-		if p.allowed(a.Addr()) {
-			p.write(a, msg)
-		}
-	}
+	p.send(append(to, p.spdpTargets()...), msg)
 }
 
 // writerConfig is a writer's configuration with the participant's sizes.
@@ -564,7 +648,7 @@ func (p *Participant) greet(pe *peer) {
 		if pe.data.BuiltinEndpoints&s.announcer == 0 {
 			continue
 		}
-		w := p.proxy(pe, rtps.GUID{Prefix: pe.data.GUID.Prefix, Entity: s.writer})
+		w := p.proxy(pe, s.reader, rtps.GUID{Prefix: pe.data.GUID.Prefix, Entity: s.writer})
 		if w.haveHB {
 			continue
 		}
@@ -577,12 +661,19 @@ func (p *Participant) greet(pe *peer) {
 	}
 }
 
-// proxy returns our view of a peer's writer. Called with mu held.
-func (p *Participant) proxy(pe *peer, writer rtps.GUID) *writerProxy {
-	w, ok := pe.proxies[writer]
+// proxyKey is one of our readers and a writer it reads.
+type proxyKey struct {
+	reader rtps.EntityID
+	writer rtps.GUID
+}
+
+// proxy returns a reader's view of a peer's writer. Called with mu held.
+func (p *Participant) proxy(pe *peer, reader rtps.EntityID, writer rtps.GUID) *writerProxy {
+	k := proxyKey{reader, writer}
+	w, ok := pe.proxies[k]
 	if !ok {
 		w = newWriterProxy()
-		pe.proxies[writer] = w
+		pe.proxies[k] = w
 	}
 	return w
 }
@@ -653,138 +744,132 @@ func (p *Participant) handleUnicast(from netip.AddrPort, b []byte) {
 	}
 }
 
-// route finds the peer and our reader a writer's traffic is for. Called
-// with mu held.
-func (p *Participant) route(src rtps.GUIDPrefix, writer rtps.EntityID) (*peer, *writerProxy, func([]Sample)) {
+// target is one of our readers a writer's submessage is for, and its view
+// of the writer.
+type target struct {
+	reader  rtps.EntityID
+	w       *writerProxy
+	deliver func([]Sample)
+}
+
+// route finds the peer and our readers a writer's submessage is for: the
+// one it is addressed to, or every one matched with the writer when it is
+// addressed to none (ENTITYID_UNKNOWN). Called with mu held.
+func (p *Participant) route(src rtps.GUIDPrefix, writer, addressed rtps.EntityID) (*peer, []target) {
 	pe, ok := p.peers[src]
 	if !ok {
-		return nil, nil, nil
+		return nil, nil
 	}
+	g := rtps.GUID{Prefix: src, Entity: writer}
 	for _, s := range sedpReaders {
 		if writer == s.writer {
 			kind := s.kind
-			return pe, p.proxy(pe, rtps.GUID{Prefix: src, Entity: writer}), func(ss []Sample) { p.onSEDP(pe, kind, ss) }
+			return pe, []target{{s.reader, p.proxy(pe, s.reader, g), func(ss []Sample) { p.onSEDP(pe, kind, ss) }}}
 		}
 	}
-	g := rtps.GUID{Prefix: src, Entity: writer}
+	var out []target
 	for _, r := range p.readers {
-		if r.matched[g] {
-			return pe, p.proxy(pe, g), func(ss []Sample) { r.deliver(g, ss) }
+		if !r.matched[g] || (addressed != (rtps.EntityID{}) && addressed != r.id) {
+			continue
+		}
+		out = append(out, target{r.id, p.proxy(pe, r.id, g), func(ss []Sample) { r.deliver(g, ss) }})
+	}
+	return pe, out
+}
+
+// delivery is samples for a reader, to hand it with mu released.
+type delivery struct {
+	deliver func([]Sample)
+	ss      []Sample
+}
+
+func deliverAll(ds []delivery) {
+	for _, d := range ds {
+		if len(d.ss) > 0 {
+			d.deliver(d.ss)
 		}
 	}
-	return nil, nil, nil
+}
+
+// feed gives each reader a submessage is for its part, and hands them what
+// they can deliver.
+func (p *Participant) feed(src rtps.GUIDPrefix, writer, addressed rtps.EntityID, f func(*writerProxy) []Sample) {
+	p.mu.Lock()
+	_, ts := p.route(src, writer, addressed)
+	var ds []delivery
+	for _, t := range ts {
+		ds = append(ds, delivery{t.deliver, f(t.w)})
+	}
+	p.mu.Unlock()
+	deliverAll(ds)
 }
 
 func (p *Participant) onData(src rtps.GUIDPrefix, d rtps.Data) {
-	p.mu.Lock()
-	_, w, deliver := p.route(src, d.Writer)
-	var ss []Sample
-	if w != nil {
-		ss = w.data(d)
-	}
-	p.mu.Unlock()
-	if len(ss) > 0 {
-		deliver(ss)
-	}
+	p.feed(src, d.Writer, d.Reader, func(w *writerProxy) []Sample { return w.data(d) })
 }
 
 func (p *Participant) onDataFrag(src rtps.GUIDPrefix, f rtps.DataFrag) {
-	p.mu.Lock()
-	_, w, deliver := p.route(src, f.Writer)
-	var ss []Sample
-	if w != nil {
-		ss = w.fragment(f)
-	}
-	p.mu.Unlock()
-	if len(ss) > 0 {
-		deliver(ss)
-	}
+	p.feed(src, f.Writer, f.Reader, func(w *writerProxy) []Sample { return w.fragment(f) })
 }
 
 func (p *Participant) onGap(src rtps.GUIDPrefix, g rtps.Gap) {
-	p.mu.Lock()
-	_, w, deliver := p.route(src, g.Writer)
-	var ss []Sample
-	if w != nil {
-		ss = w.gap(g)
-	}
-	p.mu.Unlock()
-	if len(ss) > 0 {
-		deliver(ss)
-	}
+	p.feed(src, g.Writer, g.Reader, func(w *writerProxy) []Sample { return w.gap(g) })
 }
 
+// onHeartbeat answers a writer's heartbeat for each reader it is for: what
+// it has, what it lacks.
 func (p *Participant) onHeartbeat(src rtps.GUIDPrefix, h rtps.Heartbeat) {
 	p.mu.Lock()
-	pe, w, deliver := p.route(src, h.Writer)
-	var ss []Sample
-	var ack *rtps.SequenceNumberSet
-	var nacks []fragNack
-	var count int32
-	var nackCounts []int32
-	reader := h.Reader
-	if w != nil {
-		ss, ack, nacks = w.heartbeat(h)
-		if ack != nil {
-			count = w.nextAckCount()
+	pe, ts := p.route(src, h.Writer, h.Reader)
+	var ds []delivery
+	var answer *rtps.Builder
+	for _, t := range ts {
+		ss, ack, nacks := t.w.heartbeat(h)
+		ds = append(ds, delivery{t.deliver, ss})
+		if ack == nil {
+			continue
 		}
-		for range nacks {
-			nackCounts = append(nackCounts, w.nextNackCount())
+		if answer == nil {
+			answer = rtps.NewBuilder(p.prefix, VendorID).InfoDst(src)
 		}
-		reader = p.readerFor(src, h.Writer, h.Reader)
+		for _, n := range nacks {
+			answer.NackFrag(t.reader, h.Writer, n.SN, n.Missing, t.w.nextNackCount())
+		}
+		answer.AckNack(t.reader, h.Writer, *ack, t.w.nextAckCount(), false)
+	}
+	var to []netip.AddrPort
+	if answer != nil {
+		to = p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
 	}
 	p.mu.Unlock()
-	if len(ss) > 0 {
-		deliver(ss)
-	}
-	if ack != nil {
-		p.mu.Lock()
-		to := p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
-		p.mu.Unlock()
-		b := rtps.NewBuilder(p.prefix, VendorID).InfoDst(src)
-		for i, n := range nacks {
-			b.NackFrag(reader, h.Writer, n.SN, n.Missing, nackCounts[i])
-		}
-		b.AckNack(reader, h.Writer, *ack, count, false)
-		p.send(to, b.Bytes())
+	deliverAll(ds)
+	if answer != nil {
+		p.send(to, answer.Bytes())
 	}
 }
 
 func (p *Participant) onHeartbeatFrag(src rtps.GUIDPrefix, h rtps.HeartbeatFrag) {
 	p.mu.Lock()
-	pe, w, _ := p.route(src, h.Writer)
-	if w == nil {
-		p.mu.Unlock()
-		return
+	pe, ts := p.route(src, h.Writer, h.Reader)
+	var answer *rtps.Builder
+	for _, t := range ts {
+		n := t.w.heartbeatFrag(h)
+		if n == nil {
+			continue
+		}
+		if answer == nil {
+			answer = rtps.NewBuilder(p.prefix, VendorID).InfoDst(src)
+		}
+		answer.NackFrag(t.reader, h.Writer, n.SN, n.Missing, t.w.nextNackCount())
 	}
-	n := w.heartbeatFrag(h)
-	if n == nil {
-		p.mu.Unlock()
-		return
+	var to []netip.AddrPort
+	if answer != nil {
+		to = p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
 	}
-	count := w.nextNackCount()
-	reader := p.readerFor(src, h.Writer, h.Reader)
-	to := p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
 	p.mu.Unlock()
-	msg := rtps.NewBuilder(p.prefix, VendorID).InfoDst(src).NackFrag(reader, h.Writer, n.SN, n.Missing, count).Bytes()
-	p.send(to, msg)
-}
-
-// readerFor is our reader that reads a writer: an SEDP reader, or a user
-// reader matched with it. Called with mu held.
-func (p *Participant) readerFor(src rtps.GUIDPrefix, writer, addressed rtps.EntityID) rtps.EntityID {
-	for _, s := range sedpReaders {
-		if writer == s.writer {
-			return s.reader
-		}
+	if answer != nil {
+		p.send(to, answer.Bytes())
 	}
-	g := rtps.GUID{Prefix: src, Entity: writer}
-	for id, r := range p.readers {
-		if r.matched[g] {
-			return id
-		}
-	}
-	return addressed
 }
 
 // onSEDP takes delivered SEDP samples from a peer: endpoints announced,

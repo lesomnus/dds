@@ -50,12 +50,6 @@ func CheckDomain(domain uint32) error {
 	return nil
 }
 
-// Packet is one UDP datagram received.
-type Packet struct {
-	From netip.AddrPort
-	Data []byte
-}
-
 // MulticastListener receives what is sent to a multicast group and port on
 // one interface. It only listens: nothing is sent from it.
 type MulticastListener struct {
@@ -103,6 +97,9 @@ func (l *MulticastListener) Receive(ctx context.Context, fn func(Packet)) error 
 
 // Close stops listening.
 func (l *MulticastListener) Close() error { return l.conn.Close() }
+
+// Conn is the listening socket.
+func (l *MulticastListener) Conn() *net.UDPConn { return l.conn }
 
 // InterfaceByAddr finds the interface with an address in prefix -- how Cyclone
 // DDS configurations name one (<NetworkInterface address="192.168.10.0"/>
