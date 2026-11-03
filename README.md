@@ -14,6 +14,7 @@ for monitoring. It is tested against [Cyclone DDS](https://cyclonedds.io)
 | SEDP: every endpoint's topic, type and QoS | ✓ |
 | `ros_discovery_info`: ROS nodes, several to a process, and their endpoints | ✓ |
 | Reliable reading: ordering, gaps, heartbeats, fragments (NACK_FRAG), loss | ✓ |
+| Traffic, read passively: each writer's sample rate, bytes, retransmit requests | ✓ (Linux) |
 | Publishing user data | — not a goal |
 
 ## Using it
@@ -62,6 +63,36 @@ $ ddsspy -domain 138 -iface 192.168.10.0/24 -sedp -ros      # endpoints and node
 ```
 
 `-json` prints one event per line.
+
+### Traffic
+
+`traffic` reads what writers send rather than what they say: a packet socket
+(`AF_PACKET`, needs `CAP_NET_RAW`) with a BPF filter that keeps only the first
+256 bytes of each RTPS datagram. It does not need to take part, and it takes
+nothing from the writers.
+
+- **Samples** come from sequence numbers. A writer numbers its samples
+  1, 2, 3, …, and every DATA, DATA_FRAG and HEARTBEAT carries one. The count is
+  the highest seen minus the first seen, so a missed or duplicated packet
+  changes nothing.
+- **Bytes** come from the submessage lengths, which the header gives even when
+  the packet is cut short. Samples whose size was not seen are counted at the
+  average.
+- **Retransmit requests** are the sequence numbers in ACKNACKs and the
+  fragments in NACK_FRAGs, deduplicated by the readers' counts.
+
+Capture both the DDS interface and the loopback one. Participants on one host
+reach each other over loopback, at their own addresses.
+
+Only what goes over the network is seen. A writer with no matched reader sends
+nothing. Shared-memory delivery (iceoryx) is invisible.
+
+```console
+$ ddsspy -domain 138 -iface 192.168.10.0/24 -sedp -traffic 5s
+  > 0110aca2198b5406904d051f.00001703 rt/chatter: 5 samples (1.00/s), 140 bytes, 0+0 asked again
+```
+
+One captured message costs about 130 ns.
 
 ## How it stays out of the way
 

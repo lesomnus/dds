@@ -3,10 +3,14 @@
 //
 //	ddsspy -domain 138 -iface 192.168.10.0/24 [-local] [-json] [-dump dir]
 //	ddsspy -domain 138 -iface 192.168.10.0/24 -sedp [-ros] [-json]
+//	ddsspy -domain 138 -iface 192.168.10.0/24 -sedp -traffic 5s [-json]
 //
 // With -sedp it takes part: it announces itself to the participants on this
 // host -- and only to them -- and prints their endpoints too. With -ros it
 // also reads ros_discovery_info and prints ROS nodes as they come and go.
+// With -traffic it also captures the RTPS traffic of the interface and the
+// loopback one (CAP_NET_RAW) and prints, every interval, how much each writer
+// on this host has written.
 //
 // With -json every event is one JSON object per line on stdout, which is how
 // the E2E tests read it.
@@ -32,6 +36,8 @@ import (
 	"github.com/lesomnus/dds/discovery"
 	"github.com/lesomnus/dds/participant"
 	"github.com/lesomnus/dds/ros2"
+	"github.com/lesomnus/dds/rtps"
+	"github.com/lesomnus/dds/traffic"
 	"github.com/lesomnus/dds/transport"
 )
 
@@ -43,6 +49,7 @@ func main() {
 	dump := flag.String("dump", "", "also write every datagram received to this directory")
 	sedp := flag.Bool("sedp", false, "take part (on this host only) and print endpoints too")
 	ros := flag.Bool("ros", false, "with -sedp: print ROS nodes too")
+	every := flag.Duration("traffic", 0, "with -sedp: print each local writer's traffic this often")
 	flag.Parse()
 
 	if err := transport.CheckDomain(uint32(*domain)); err != nil {
@@ -60,7 +67,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *sedp {
-		if err := runParticipant(ctx, uint32(*domain), ifi, addr, out, *ros); err != nil {
+		if err := runParticipant(ctx, uint32(*domain), ifi, addr, out, *ros, *every); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -95,14 +102,22 @@ func main() {
 
 // runParticipant takes part in the domain and prints participants and
 // endpoints until the context ends. On the way out it logs where it sent.
-func runParticipant(ctx context.Context, domain uint32, ifi *net.Interface, addr netip.Addr, out *printer, ros bool) error {
+func runParticipant(ctx context.Context, domain uint32, ifi *net.Interface, addr netip.Addr, out *printer, ros bool, every time.Duration) error {
 	var graph *ros2.Graph
-	events := out.print
+	var stats *traffic.Stats
+	if every > 0 {
+		stats = traffic.NewStats()
+	}
 	if ros {
 		graph = ros2.NewGraph(out.node)
-		events = func(e discovery.Event) {
-			out.print(e)
+	}
+	events := func(e discovery.Event) {
+		out.print(e)
+		if graph != nil {
 			graph.HandleDiscovery(e)
+		}
+		if l, ok := e.(discovery.ParticipantLost); ok && stats != nil {
+			stats.ForgetParticipant(l.Participant.GUID.Prefix)
 		}
 	}
 	p, err := participant.New(participant.Config{Domain: domain, Interface: ifi, Addr: addr, Name: "ddsspy"}, events)
@@ -115,11 +130,93 @@ func runParticipant(ctx context.Context, domain uint32, ifi *net.Interface, addr
 		}
 	}
 	log.Printf("participant %s at %s", p.GUIDPrefix(), p.Addr())
+	if stats != nil {
+		c, err := openCapture(ifi)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := c.Run(ctx, func(pk traffic.Packet) { stats.Observe(pk.Message, pk.At) }); err != nil && ctx.Err() == nil {
+				log.Printf("capture: %v", err)
+			}
+			c.Close()
+		}()
+		go reportTraffic(ctx, p, stats, c, every, out)
+	}
 	err = p.Run(ctx)
 	for to, n := range p.Sent() {
 		log.Printf("sent %d datagrams to %s", n, to)
 	}
 	return err
+}
+
+func openCapture(ifi *net.Interface) (*traffic.Capture, error) {
+	names := []string{ifi.Name}
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range ifs {
+		if i.Flags&net.FlagLoopback != 0 && i.Name != ifi.Name {
+			names = append(names, i.Name)
+		}
+	}
+	c, err := traffic.Open(traffic.CaptureConfig{Interfaces: names})
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("capturing on %s", strings.Join(names, ", "))
+	return c, nil
+}
+
+// reportTraffic prints, every interval, what each writer of a participant on
+// this host has written since the last time.
+func reportTraffic(ctx context.Context, p *participant.Participant, stats *traffic.Stats, c *traffic.Capture, every time.Duration, out *printer) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	last := map[rtps.GUID]traffic.Writer{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		local := map[rtps.GUIDPrefix]bool{}
+		for _, q := range p.Participants() {
+			local[q.GUID.Prefix] = true
+		}
+		topics := map[rtps.GUID]discovery.Endpoint{}
+		for _, e := range p.Endpoints() {
+			topics[e.GUID] = e
+		}
+		seen := map[rtps.GUID]traffic.Writer{}
+		for _, w := range stats.Writers() {
+			if !local[w.GUID.Prefix] {
+				continue
+			}
+			seen[w.GUID] = w
+			prev, ok := last[w.GUID]
+			if !ok {
+				continue // a rate needs two looks
+			}
+			samples := w.Samples() - prev.Samples()
+			l := Line{
+				Event: "writer_traffic", At: w.LastSeen, GUIDPrefix: w.GUID.Prefix.String(), GUID: w.GUID.String(),
+				Samples: samples, Bytes: w.Bytes() - prev.Bytes(),
+				RetransmitRequests: w.RetransmitRequests - prev.RetransmitRequests,
+				FragmentRequests:   w.FragmentRequests - prev.FragmentRequests,
+				Interval:           every.String(), Drops: c.Drops(),
+			}
+			if e, ok := topics[w.GUID]; ok {
+				l.Topic, l.Type = e.Topic, e.Type
+			}
+			l.Rate = float64(samples) / every.Seconds()
+			out.line(l, func() string {
+				return fmt.Sprintf("  > %s %s: %d samples (%.2f/s), %d bytes, %d+%d asked again", l.GUID, l.Topic, l.Samples, l.Rate, l.Bytes, l.RetransmitRequests, l.FragmentRequests)
+			})
+		}
+		last = seen
+	}
 }
 
 // runDumping is Run, writing every datagram to dir as it goes.
@@ -182,6 +279,25 @@ type Line struct {
 	Node    string `json:"node,omitempty"`
 	Readers int    `json:"readers,omitempty"`
 	Writers int    `json:"writers,omitempty"`
+
+	// Traffic (writer_traffic): of one writer, over the interval.
+	Interval           string  `json:"interval,omitempty"`
+	Samples            int64   `json:"samples,omitempty"`
+	Rate               float64 `json:"rate,omitempty"`
+	Bytes              int64   `json:"bytes,omitempty"`
+	RetransmitRequests int64   `json:"retransmit_requests,omitempty"`
+	FragmentRequests   int64   `json:"fragment_requests,omitempty"`
+	Drops              uint64  `json:"drops,omitempty"`
+}
+
+func (o *printer) line(l Line, text func() string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.json {
+		_ = o.enc.Encode(l)
+		return
+	}
+	fmt.Println(text())
 }
 
 func (o *printer) print(e discovery.Event) {
