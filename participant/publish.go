@@ -64,14 +64,14 @@ func (p *Participant) Publish(pub Publication) (*Writer, error) {
 	k := p.nextKey
 	p.nextKey++
 	id := rtps.EntityID{byte(k >> 16), byte(k >> 8), byte(k), 0x03} // user-defined writer, no key
-	w := &Writer{p: p, id: id, pub: pub, w: newStateWriter(p.prefix, writerConfig{
+	w := &Writer{p: p, id: id, pub: pub, w: newStateWriter(p.prefix, p.writerConfig(writerConfig{
 		id:             id,
 		reliable:       q.Reliability == rtps.Reliable,
 		transientLocal: q.Durability >= rtps.TransientLocal,
 		keepAll:        q.History == rtps.KeepAll,
 		depth:          int(q.Depth),
 		maxSamples:     int(q.MaxSamples),
-	})}
+	}))}
 	p.writers[id] = w
 	now := p.cfg.Now()
 	_, out, _ := p.pubsW.write(change{at: now, payload: p.writerData(w), key: w.GUID()})

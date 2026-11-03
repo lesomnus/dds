@@ -3,9 +3,11 @@
 // to the topics it is asked to and publishes on those it is asked to,
 // reliably or not.
 //
-// It talks only to participants its filter keeps, and only by unicast to
-// addresses of this host: it announces itself to no one else. A participant
-// that only subscribes publishes nothing but its discovery.
+// Its Scope says who it talks to. By default (ScopeHost) that is only the
+// participants on this host, only by unicast to addresses of this host: it
+// announces itself to no one else. ScopeNetwork reaches the DDS interface's
+// network too. A participant that only subscribes publishes nothing but its
+// discovery.
 //
 // Payloads are the user's: serialized, encapsulation header first, as they
 // go on the wire. Topics are keyless.
@@ -15,6 +17,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -37,11 +40,34 @@ type Config struct {
 	Interface *net.Interface
 	Addr      netip.Addr
 
-	// Filter keeps the participants to talk to. It must keep only
-	// participants on this host: the participant refuses to send anywhere
-	// else whatever the filter says. Nil keeps the local ones
-	// (discovery.LocalOnly).
+	// Scope is who it talks to: by default (ScopeHost) only the
+	// participants on this host.
+	Scope Scope
+	// Filter keeps the participants to talk to, within the scope: the
+	// participant refuses to send outside its scope whatever the filter
+	// says. Nil keeps those of the scope: the local ones (discovery.LocalOnly)
+	// in ScopeHost, every one in ScopeNetwork.
 	Filter discovery.Filter
+	// Peers are addresses SPDP is sent to by unicast, in ScopeNetwork:
+	// participants on a network multicast does not cross, or with
+	// NoMulticast.
+	Peers []netip.Addr
+	// NoMulticast keeps ScopeNetwork from announcing to the SPDP multicast
+	// group: only Peers, and the participants that announce themselves,
+	// learn of it.
+	NoMulticast bool
+	// Ports is how the unicast port is picked.
+	Ports PortPolicy
+
+	// MaxMessageSize bounds a datagram, and FragmentSize the fragments of a
+	// sample too large for one. Zero is 60064 and 16000 in ScopeHost (the
+	// loopback carries 64 KiB), Cyclone DDS's 14720 and 1344 in ScopeNetwork.
+	MaxMessageSize int
+	FragmentSize   int
+	// MaxSendRate bounds what is sent, in bytes a second; zero does not.
+	// Datagrams wait in a queue; one that finds it full is dropped (see
+	// Dropped), for reliable writers to send again.
+	MaxSendRate int
 
 	// LeaseDuration is what the participant announces; zero is 10 s, Cyclone
 	// DDS's default. It is renewed every AnnounceInterval (zero: a third of
@@ -67,11 +93,15 @@ type Participant struct {
 	log    *slog.Logger
 	events func(discovery.Event)
 
-	conn  *net.UDPConn
-	mcast *transport.MulticastListener
-	addr  netip.AddrPort
-	local map[netip.Addr]bool
-	spdp  *discovery.SPDPObserver
+	conn      *net.UDPConn
+	mcast     *transport.MulticastListener
+	addr      netip.AddrPort
+	local     map[netip.Addr]bool
+	nets      []netip.Prefix // the DDS interface's subnets
+	peerAddrs map[netip.Addr]bool
+	index     int // participant index of the port; -1: none
+	pacer     *pacer
+	spdp      *discovery.SPDPObserver
 
 	mu        sync.Mutex
 	peers     map[rtps.GUIDPrefix]*peer
@@ -119,12 +149,37 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Scope != ScopeHost && cfg.Scope != ScopeNetwork {
+		return nil, fmt.Errorf("participant: scope %s", cfg.Scope)
+	}
+	if cfg.MaxMessageSize <= 0 {
+		cfg.MaxMessageSize = hostMaxMessage
+		if cfg.Scope == ScopeNetwork {
+			cfg.MaxMessageSize = networkMaxMessage
+		}
+	}
+	if cfg.FragmentSize <= 0 {
+		cfg.FragmentSize = hostFragment
+		if cfg.Scope == ScopeNetwork {
+			cfg.FragmentSize = networkFragment
+		}
+	}
+	if cfg.MaxMessageSize > 65507 || cfg.MaxMessageSize < messageOverhead+64 {
+		return nil, fmt.Errorf("participant: a message size of %d", cfg.MaxMessageSize)
+	}
+	if cfg.FragmentSize > cfg.MaxMessageSize-messageOverhead || cfg.FragmentSize < 64 {
+		return nil, fmt.Errorf("participant: a fragment size of %d for messages of %d", cfg.FragmentSize, cfg.MaxMessageSize)
+	}
 	local, err := transport.LocalAddrs()
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Filter == nil {
-		cfg.Filter = discovery.LocalOnly(local)
+		if cfg.Scope == ScopeHost {
+			cfg.Filter = discovery.LocalOnly(local)
+		} else {
+			cfg.Filter = func(*discovery.Participant) bool { return true }
+		}
 	}
 
 	p := &Participant{
@@ -138,22 +193,36 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 		writers:   map[rtps.EntityID]*Writer{},
 		sent:      map[netip.AddrPort]int64{},
 		nextKey:   1,
+		nets:      interfaceNets(cfg.Interface),
+		peerAddrs: map[netip.Addr]bool{},
+	}
+	for _, a := range cfg.Peers {
+		p.peerAddrs[a.Unmap()] = true
 	}
 	if _, err := rand.Read(p.prefix[:]); err != nil {
 		return nil, err
 	}
-	sedp := writerConfig{reliable: true, transientLocal: true, keyed: true}
+	sedp := p.writerConfig(writerConfig{reliable: true, transientLocal: true, keyed: true})
 	sedp.id = rtps.EntitySEDPPublicationsWriter
 	p.pubsW = newStateWriter(p.prefix, sedp)
 	sedp.id = rtps.EntitySEDPSubscriptionsWriter
 	p.subsW = newStateWriter(p.prefix, sedp)
 
-	conn, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(cfg.Addr, 0)))
+	conn, err := p.listen()
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetReadBuffer(1 << 20)
+	_ = conn.SetReadBuffer(4 << 20)
 	p.conn = conn
+	if cfg.Scope == ScopeNetwork && !cfg.NoMulticast {
+		if err := p.setMulticast(); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	if cfg.MaxSendRate > 0 {
+		p.pacer = newPacer(cfg.MaxSendRate, 4*cfg.MaxMessageSize, p.write)
+	}
 	p.addr = conn.LocalAddr().(*net.UDPAddr).AddrPort()
 	p.addr = netip.AddrPortFrom(p.addr.Addr().Unmap(), p.addr.Port())
 
@@ -163,9 +232,11 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 		return nil, err
 	}
 	p.mcast = mcast
+	filter := cfg.Filter
 	p.spdp = discovery.NewSPDPObserver(discovery.SPDPConfig{
 		Domain: cfg.Domain,
-		Filter: cfg.Filter,
+		// Not ourselves: our multicast announcements come back to us.
+		Filter: func(d *discovery.Participant) bool { return d.GUID.Prefix != p.prefix && filter(d) },
 		Now:    cfg.Now,
 	}, p.onSPDP)
 	return p, nil
@@ -209,6 +280,16 @@ func (p *Participant) Run(ctx context.Context) error {
 	defer cancel()
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
+
+	if p.pacer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.pacer.run(ctx)
+		}()
+	}
+	// Announce ourselves at once to whoever the scope lets us find.
+	p.send(p.spdpTargets(), p.spdpMessage())
 
 	wg.Add(3)
 	go func() {
@@ -295,7 +376,7 @@ func (p *Participant) onSPDP(e discovery.Event) {
 		p.mu.Lock()
 		if pe, ok := p.peers[e.Participant.GUID.Prefix]; ok {
 			pe.data = e.Participant
-			pe.metatraffic = p.localLocators(e.Participant.MetatrafficUnicast)
+			pe.metatraffic = p.reachable(e.Participant.From.Addr(), e.Participant.MetatrafficUnicast)
 		}
 		p.mu.Unlock()
 	case discovery.ParticipantLost:
@@ -323,11 +404,11 @@ func (p *Participant) onSPDP(e discovery.Event) {
 }
 
 // addPeer registers a discovered participant; nil if it cannot be talked to
-// (no metatraffic address on this host). Called with mu held.
+// (no metatraffic address the scope lets us reach). Called with mu held.
 func (p *Participant) addPeer(d discovery.Participant) *peer {
-	meta := p.localLocators(d.MetatrafficUnicast)
+	meta := p.reachable(d.From.Addr(), d.MetatrafficUnicast)
 	if len(meta) == 0 {
-		p.log.Debug("participant has no local metatraffic address; not talking to it", "guid", d.GUID.Prefix)
+		p.log.Debug("participant has no metatraffic address in scope; not talking to it", "guid", d.GUID.Prefix, "scope", p.cfg.Scope)
 		return nil
 	}
 	pe := &peer{data: d, metatraffic: meta, proxies: map[rtps.GUID]*writerProxy{}}
@@ -335,33 +416,31 @@ func (p *Participant) addPeer(d discovery.Participant) *peer {
 	return pe
 }
 
-// localLocators keeps the UDPv4 locators that are addresses of this host.
-func (p *Participant) localLocators(ls []rtps.Locator) []netip.AddrPort {
-	var out []netip.AddrPort
-	for _, l := range ls {
-		if l.Kind == rtps.LocatorUDPv4 && p.local[l.Addr] && l.Port > 0 && l.Port < 65536 {
-			out = append(out, netip.AddrPortFrom(l.Addr, uint16(l.Port)))
-		}
-	}
-	return out
-}
-
-// send writes a message to every address, if it is of this host. It is the
-// one place datagrams leave.
+// send writes a message to every address the scope allows. It is the one
+// place datagrams leave.
 func (p *Participant) send(to []netip.AddrPort, b []byte) {
 	for _, a := range to {
-		if !p.local[a.Addr()] {
-			p.log.Error("refusing to send off this host", "to", a)
+		if !p.allowed(a.Addr()) {
+			p.log.Error("refusing to send out of scope", "to", a, "scope", p.cfg.Scope)
 			continue
 		}
-		if _, err := p.conn.WriteToUDPAddrPort(b, a); err != nil {
-			p.log.Debug("send", "to", a, "err", err)
+		if p.pacer != nil {
+			p.pacer.enqueue(a, b)
 			continue
 		}
-		p.mu.Lock()
-		p.sent[a]++
-		p.mu.Unlock()
+		p.write(a, b)
 	}
+}
+
+// write sends one datagram, now.
+func (p *Participant) write(a netip.AddrPort, b []byte) {
+	if _, err := p.conn.WriteToUDPAddrPort(b, a); err != nil {
+		p.log.Debug("send", "to", a, "err", err)
+		return
+	}
+	p.mu.Lock()
+	p.sent[a]++
+	p.mu.Unlock()
 }
 
 func (p *Participant) emit(e discovery.Event) {
@@ -425,6 +504,7 @@ func (p *Participant) announceAll() {
 		peers = append(peers, pe)
 	}
 	p.mu.Unlock()
+	p.send(p.spdpTargets(), msg)
 	for _, pe := range peers {
 		p.send(pe.metatraffic, msg)
 		p.greet(pe)
@@ -450,7 +530,18 @@ func (p *Participant) sayGoodbye() {
 		to = append(to, pe.metatraffic...)
 	}
 	p.mu.Unlock()
-	p.send(to, msg)
+	// Not through the send queue: it stops with Run.
+	for _, a := range append(to, p.spdpTargets()...) {
+		if p.allowed(a.Addr()) {
+			p.write(a, msg)
+		}
+	}
+}
+
+// writerConfig is a writer's configuration with the participant's sizes.
+func (p *Participant) writerConfig(c writerConfig) writerConfig {
+	c.maxMessage, c.fragSize = p.cfg.MaxMessageSize, p.cfg.FragmentSize
+	return c
 }
 
 // sedpReaders are our SEDP readers and the writers they read.

@@ -5,6 +5,10 @@
 //	ddscat pub -domain 138 -iface 192.168.10.0/24 -topic rt/chatter -type std_msgs::msg::dds_::String_ -string 'hello {n}' -rate 100ms -count 10
 //	ddscat pub ... -size 100000              # a string of 100000 'x'
 //	ddscat sub -domain 138 -iface 192.168.10.0/24 -topic rt/chatter -type std_msgs::msg::dds_::String_
+//	ddscat sub ... -scope network [-peer 192.168.10.7] [-no-multicast]
+//
+// By default it talks to participants on this host only; -scope network
+// reaches the interface's network too.
 //
 // It prints one JSON object per line: what it wrote (pub), or each sample
 // it read (sub). The topic and type names are the user's: for ROS 2, "rt/"
@@ -79,6 +83,11 @@ func main() {
 	count := fs.Int("count", 0, "pub: stop after this many (0: never)")
 	wait := fs.Int("wait", 0, "pub: wait for this many readers to be ready (matched both ways) before the first sample")
 	linger := fs.Duration("linger", 2*time.Second, "pub: stay this long after the last sample, for reliable readers to catch up")
+	scope := fs.String("scope", "host", "who to talk to: host (this host only) or network (the interface's network too)")
+	var peers peerList
+	fs.Var(&peers, "peer", "with -scope network: an address to announce to by unicast (repeatable)")
+	noMulticast := fs.Bool("no-multicast", false, "with -scope network: announce to -peer addresses only")
+	sendRate := fs.Int("send-rate", 0, "send at most this many bytes a second (0: no limit)")
 	_ = fs.Parse(os.Args[2:])
 	if *topic == "" || *typ == "" {
 		log.Fatal("-topic and -type are required")
@@ -94,7 +103,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	p, err := participant.New(participant.Config{Domain: uint32(*domain), Interface: ifi, Addr: addr, Name: "ddscat"}, nil)
+	sc := map[string]participant.Scope{"host": participant.ScopeHost, "network": participant.ScopeNetwork}
+	s, ok := sc[*scope]
+	if !ok {
+		log.Fatalf("-scope %q", *scope)
+	}
+	p, err := participant.New(participant.Config{
+		Domain: uint32(*domain), Interface: ifi, Addr: addr, Name: "ddscat",
+		Scope: s, Peers: peers, NoMulticast: *noMulticast, MaxSendRate: *sendRate,
+	}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -109,7 +126,7 @@ func main() {
 	run, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { done <- p.Run(run) }()
-	log.Printf("participant %s at %s", p.GUIDPrefix(), p.Addr())
+	log.Printf("participant %s at %s, scope %s, participant index %d", p.GUIDPrefix(), p.Addr(), s, p.ParticipantIndex())
 
 	switch mode {
 	case "sub":
@@ -178,6 +195,18 @@ func main() {
 	if err := <-done; err != nil {
 		log.Fatal(err)
 	}
+}
+
+type peerList []netip.Addr
+
+func (l *peerList) String() string { return fmt.Sprint(*l) }
+func (l *peerList) Set(s string) error {
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return err
+	}
+	*l = append(*l, a)
+	return nil
 }
 
 // cdrPayload is a CDR little-endian serialized string: the encapsulation

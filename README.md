@@ -132,14 +132,22 @@ state, and each writer's traffic as metrics.
 
 ## How it stays out of the way
 
-- **It talks only to this host.** A `participant.Participant` announces
-  itself to the participants its filter keeps (by default those whose packets
-  come from an address of this host), by unicast to their addresses on this
-  host. Nothing is multicast. Every datagram leaves through one function that
-  refuses any destination that is not an address of this host. Another
-  machine's participants are received — SPDP multicast reaches the socket — and
-  ignored; they never learn of it. The E2E tests check this from the other
-  machine with tcpdump.
+- **By default it talks only to this host.** In `ScopeHost`, the default, a
+  `participant.Participant` announces itself only to the participants its
+  filter keeps. By default those are the ones whose packets come from an
+  address of this host, and it reaches them by unicast to their addresses on
+  this host. Nothing is multicast. Every datagram leaves through one function
+  that refuses any destination the scope does not allow. Another machine's
+  participants are received (SPDP multicast reaches the socket) and ignored;
+  they never learn of it. The E2E tests check this from the other machine with
+  tcpdump.
+- **`ScopeNetwork` reaches the DDS interface's network, and no further.** It
+  announces itself to the SPDP multicast group (TTL 1) and to `Peers`. It sends
+  only to addresses in the interface's subnets, to `Peers`, and to that group.
+  It takes the first free participant index and its well-known port
+  (7410 + 250·domain + 2·index), the range a firewall opens for a domain.
+  It sends datagrams of Cyclone DDS's default sizes (14720 octets, fragments
+  of 1344), optionally paced (`MaxSendRate`).
 - **It writes only when asked.** An observer announces readers and no
   writers. Nothing publishes `ros_discovery_info`, so a participant is never a
   ROS node: `ros2 node list` does not show it.
@@ -157,7 +165,7 @@ state, and each writer's traffic as metrics.
 | [`ros2`](ros2) | `ros_discovery_info`, the node graph, ROS names of DDS topics and types |
 | [`cdr`](cdr) | XCDR1 marshalling (from [lesomnus/cdr](https://github.com/lesomnus/cdr)) |
 | [`cmd/ddsspy`](cmd/ddsspy) | prints a domain's participants, endpoints and nodes as they come and go |
-| [`cmd/ddscat`](cmd/ddscat) | publishes to a topic, or prints what is published on one |
+| [`cmd/ddscat`](cmd/ddscat) | publishes to a topic, or prints what is published on one (`-scope network` for other hosts) |
 
 ## Limits
 
@@ -169,8 +177,9 @@ state, and each writer's traffic as metrics.
 - Endpoints match on topic, type, reliability and durability. Other QoS
   (deadline, lifespan, ownership, partitions, ...) is reported, not enforced.
 - Topics are keyless: no keys, instances, dispose or unregister of samples.
-- Only participants on this host are talked to. A participant's own writers and
-  readers do not meet: it does not discover itself.
+- IPv4 and one interface. `ScopeNetwork` stays on the link (multicast TTL 1)
+  and reaches no routed network. A participant's own writers and readers do
+  not meet: it does not discover itself.
 - A writer does not wait. `Write` returns at once, and a full KEEP_ALL history
   is an error rather than a block. There is no flow control.
 - Samples are limited to 1 MiB and 1024 ahead of the next in order.
