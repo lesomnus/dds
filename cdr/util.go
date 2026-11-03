@@ -28,3 +28,33 @@ func maxAlignOf(v reflect.Type) int {
 	}
 	return n
 }
+
+// minSize is the fewest bytes a value of the type takes when encoded,
+// alignment aside: what a sequence's length can be checked against.
+func minSize(t reflect.Type) int {
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int8, reflect.Uint8:
+		return 1
+	case reflect.Int16, reflect.Uint16:
+		return 2
+	case reflect.Int32, reflect.Uint32, reflect.Float32:
+		return 4
+	case reflect.Int64, reflect.Uint64, reflect.Float64:
+		return 8
+	case reflect.String, reflect.Slice:
+		return 4 // the length
+	case reflect.Array:
+		return t.Len() * minSize(t.Elem())
+	case reflect.Struct:
+		n := 0
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).IsExported() {
+				n += minSize(t.Field(i).Type)
+			}
+		}
+		return n
+	case reflect.Ptr:
+		return minSize(t.Elem())
+	}
+	return 0
+}

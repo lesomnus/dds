@@ -339,6 +339,11 @@ func (u *unmarshaler) unmarshalSlice(v reflect.Value) error {
 	if err := u.align(s); err != nil {
 		return err
 	}
+	// A length is a claim: no more elements can follow than the bytes left
+	// can hold, and none is allocated for before that is so.
+	if m := minSize(t.Elem()); m > 0 && uint64(l)*uint64(m) > uint64(len(u.b)-u.p) {
+		return io.ErrUnexpectedEOF
+	}
 
 	w := reflect.MakeSlice(v.Type(), int(l), int(l))
 	for i := range int(l) {
