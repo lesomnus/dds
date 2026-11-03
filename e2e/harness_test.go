@@ -56,6 +56,7 @@ var (
 	setupOnce sync.Once
 	setupErr  error
 	spyBin    string // ddsspy built for the daemon's architecture
+	catBin    string // ddscat, likewise
 )
 
 // setup builds the image if it is missing and ddsspy for the daemon.
@@ -82,11 +83,14 @@ func setup(t testing.TB) {
 			setupErr = err
 			return
 		}
-		spyBin = filepath.Join(dir, "ddsspy")
-		build := exec.Command("go", "build", "-o", spyBin, "../cmd/ddsspy")
-		build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
-		if out, err := build.CombinedOutput(); err != nil {
-			setupErr = fmt.Errorf("build ddsspy: %v\n%s", err, out)
+		spyBin, catBin = filepath.Join(dir, "ddsspy"), filepath.Join(dir, "ddscat")
+		for bin, pkg := range map[string]string{spyBin: "../cmd/ddsspy", catBin: "../cmd/ddscat"} {
+			build := exec.Command("go", "build", "-o", bin, pkg)
+			build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
+			if out, err := build.CombinedOutput(); err != nil {
+				setupErr = fmt.Errorf("build %s: %v\n%s", pkg, err, out)
+				return
+			}
 		}
 	})
 	if setupErr != nil {
@@ -139,6 +143,7 @@ func (l *LAN) NewHost(t testing.TB) *Host {
 		"--entrypoint", "sleep", image(), "infinity")
 	t.Cleanup(func() { dockerQuiet("rm", "-f", h.name) })
 	docker(t, "cp", spyBin, h.name+":/ddsspy")
+	docker(t, "cp", catBin, h.name+":/ddscat")
 	return h
 }
 
@@ -159,6 +164,9 @@ func (h *Host) Run(t testing.TB, domain uint32, exe string, args ...string) *Pro
 	t.Cleanup(func() { dockerQuiet("rm", "-f", p.name) })
 	return p
 }
+
+// Logs is what it has printed, stdout and stderr.
+func (p *Process) Logs() string { return docker(p.t, "logs", p.name) }
 
 // Stop shuts it down gracefully (SIGTERM).
 func (p *Process) Stop() { docker(p.t, "stop", "-t", "10", p.name) }

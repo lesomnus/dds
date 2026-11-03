@@ -24,6 +24,8 @@ type Subscription struct {
 	QoS   ReaderQoS
 	// Keyed: the type has a key (the reader's entity kind says so).
 	Keyed bool
+	// UserData is announced with the reader (USER_DATA QoS).
+	UserData []byte
 	// Handle gets each sample with data, in its writer's order. It is called
 	// with no lock held, from the receiving goroutine: it must not block.
 	Handle func(writer rtps.GUID, s Sample)
@@ -67,18 +69,16 @@ func (p *Participant) Subscribe(s Subscription) error {
 	id := rtps.EntityID{byte(k >> 16), byte(k >> 8), byte(k), kind}
 	r := &userReader{id: id, sub: s, matched: map[rtps.GUID]bool{}}
 	p.readers[id] = r
-	p.subs = append(p.subs, p.readerData(r))
+	guid := rtps.GUID{Prefix: p.prefix, Entity: id}
+	_, out, _ := p.subsW.write(change{at: p.cfg.Now(), payload: p.readerData(r), key: guid})
 	var nudge []matchNudge
 	for _, ep := range p.endpoints {
 		if n, ok := p.matchOne(r, ep); ok {
 			nudge = append(nudge, n)
 		}
 	}
-	peers := p.peerList()
 	p.mu.Unlock()
-	for _, pe := range peers {
-		p.sendSubscriptions(pe, nil)
-	}
+	p.sendAll(out)
 	p.nudge(nudge)
 	return nil
 }
@@ -86,15 +86,18 @@ func (p *Participant) Subscribe(s Subscription) error {
 // readerData is the SEDP announcement of one of our readers.
 func (p *Participant) readerData(r *userReader) []byte {
 	q := r.sub.QoS
-	return (&rtps.ParameterListWriter{}).
+	pl := (&rtps.ParameterListWriter{}).
 		GUID(rtps.PIDEndpointGUID, rtps.GUID{Prefix: p.prefix, Entity: r.id}).
 		GUID(rtps.PIDParticipantGUID, rtps.GUID{Prefix: p.prefix, Entity: rtps.EntityParticipant}).
 		String(rtps.PIDTopicName, r.sub.Topic).
 		String(rtps.PIDTypeName, r.sub.Type).
 		Raw(rtps.PIDReliability, append(le32(uint32(q.Reliability)), 0, 0, 0, 0, 0, 0, 0, 0)).
 		Uint32(rtps.PIDDurability, uint32(q.Durability)).
-		Raw(rtps.PIDHistory, append(le32(uint32(q.History)), le32(uint32(q.Depth))...)).
-		Payload()
+		Raw(rtps.PIDHistory, append(le32(uint32(q.History)), le32(uint32(q.Depth))...))
+	if r.sub.UserData != nil {
+		pl.Octets(rtps.PIDUserData, r.sub.UserData)
+	}
+	return pl.Payload()
 }
 
 func le32(v uint32) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)} }
@@ -156,8 +159,12 @@ func (p *Participant) match(ep *discovery.Endpoint) []matchNudge {
 	return out
 }
 
-// unmatch forgets a writer gone. Called with mu held.
+// unmatch forgets an endpoint gone: a writer our readers read, or a reader
+// our writers write to. Called with mu held.
 func (p *Participant) unmatch(ep *discovery.Endpoint) {
+	for _, w := range p.writers {
+		w.w.removeReader(ep.GUID)
+	}
 	for _, r := range p.readers {
 		delete(r.matched, ep.GUID)
 	}
@@ -197,84 +204,4 @@ func (p *Participant) peerList() []*peer {
 		out = append(out, pe)
 	}
 	return out
-}
-
-// Our SEDP subscriptions writer: a minimal reliable writer whose history is
-// one sample per reader (SN 1, 2, ...), never removed, sent to each peer's
-// subscriptions reader until it acknowledges them.
-
-// sendSubscriptions sends a peer the announcements it asks for (nil: all of
-// them) and a heartbeat for the whole history.
-func (p *Participant) sendSubscriptions(pe *peer, want []rtps.SequenceNumber) {
-	p.mu.Lock()
-	subs := append([][]byte(nil), p.subs...)
-	p.subHB++
-	count := p.subHB
-	p.mu.Unlock()
-	if len(subs) == 0 {
-		return
-	}
-	if want == nil {
-		for i := range subs {
-			want = append(want, rtps.SequenceNumber(i+1))
-		}
-	}
-	last := rtps.SequenceNumber(len(subs))
-	b := rtps.NewBuilder(p.prefix, VendorID).InfoDst(pe.data.GUID.Prefix).InfoTS(p.cfg.Now())
-	n := 0
-	for _, sn := range want {
-		if sn < 1 || sn > last {
-			continue
-		}
-		b.Data(rtps.EntitySEDPSubscriptionsReader, rtps.EntitySEDPSubscriptionsWriter, sn, nil, subs[sn-1], false)
-		n++
-		if n%8 == 0 { // keep datagrams small
-			p.send(pe.metatraffic, b.Bytes())
-			b = rtps.NewBuilder(p.prefix, VendorID).InfoDst(pe.data.GUID.Prefix).InfoTS(p.cfg.Now())
-		}
-	}
-	b.Heartbeat(rtps.EntitySEDPSubscriptionsReader, rtps.EntitySEDPSubscriptionsWriter, 1, last, count, false)
-	p.send(pe.metatraffic, b.Bytes())
-}
-
-// heartbeatSubscriptions renews the heartbeat to a peer that has not
-// acknowledged every announcement.
-func (p *Participant) heartbeatSubscriptions(pe *peer) {
-	p.mu.Lock()
-	last := rtps.SequenceNumber(len(p.subs))
-	acked := pe.subsAcked
-	p.mu.Unlock()
-	if last == 0 || acked > last {
-		return
-	}
-	p.sendSubscriptions(pe, nil)
-}
-
-// onAckNack takes an ACKNACK for our SEDP subscriptions writer: what the
-// peer has, and what it asks for again.
-func (p *Participant) onAckNack(src rtps.GUIDPrefix, a rtps.AckNack) {
-	if a.Writer != rtps.EntitySEDPSubscriptionsWriter {
-		return
-	}
-	p.mu.Lock()
-	pe, ok := p.peers[src]
-	if ok && a.State.Base > pe.subsAcked {
-		pe.subsAcked = a.State.Base
-	}
-	last := rtps.SequenceNumber(len(p.subs))
-	p.mu.Unlock()
-	if !ok {
-		return
-	}
-	want := a.State.Members()
-	if len(want) == 0 && a.State.Base <= last {
-		// It acknowledged less than we have and asked for nothing: it is
-		// a preemptive ACKNACK, or it lost the heartbeat. Send what is past it.
-		for sn := a.State.Base; sn <= last; sn++ {
-			want = append(want, sn)
-		}
-	}
-	if len(want) > 0 {
-		p.sendSubscriptions(pe, want)
-	}
 }

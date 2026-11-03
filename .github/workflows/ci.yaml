@@ -20,6 +20,7 @@ jobs:
       # change: a decoder that panics on a packet is a crash on a robot.
       - run: go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 30s ./rtps/
       - run: go test -run '^$' -fuzz '^FuzzWriterProxy$' -fuzztime 30s ./participant/
+      - run: go test -run '^$' -fuzz '^FuzzStateWriter$' -fuzztime 30s ./participant/
       - run: go test -run '^$' -fuzz '^FuzzParseParticipantEntitiesInfo$' -fuzztime 30s ./ros2/
       - run: go test -run '^$' -fuzz '^FuzzObserve$' -fuzztime 30s ./traffic/
 

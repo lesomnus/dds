@@ -2,11 +2,18 @@
 
 A DDS participant in pure Go (no cgo), speaking DDSI-RTPS over UDP.
 
-Its first aim is narrow: to **observe a ROS 2 system** without joining it as a
-node — which participants are up and what process each is, what every one of
-them publishes and subscribes to with which QoS, and which ROS nodes they host —
-for monitoring. It is tested against [Cyclone DDS](https://cyclonedds.io)
-0.10.x as ROS 2 Jazzy runs it (`rmw_cyclonedds_cpp`).
+It began as an observer: it watches a ROS 2 system for monitoring without
+joining it as a node. It shows which participants are up and what process each
+is, what every one of them publishes and subscribes to with which QoS, and which
+ROS nodes they host. It now also **publishes and subscribes**. Payloads are the
+user's, serialized, so it moves them without knowing their type. It is tested
+against [Cyclone DDS](https://cyclonedds.io) 0.10.x as ROS 2 Jazzy runs it
+(`rmw_cyclonedds_cpp`).
+
+The DDS packages know nothing of ROS. Topic names like `rt/chatter`, type names
+like `std_msgs::msg::dds_::String_` and CDR payloads are what a user hands them.
+ROS's conventions live in [`ros2`](ros2), on top, and a test
+([`internal/boundary`](internal/boundary)) keeps it that way.
 
 | | |
 |---|---|
@@ -15,7 +22,8 @@ for monitoring. It is tested against [Cyclone DDS](https://cyclonedds.io)
 | `ros_discovery_info`: ROS nodes, several to a process, and their endpoints | ✓ |
 | Reliable reading: ordering, gaps, heartbeats, fragments (NACK_FRAG), loss | ✓ |
 | Traffic, read passively: each writer's sample rate, bytes, retransmit requests | ✓ (Linux) |
-| Publishing user data | — not a goal |
+| Publishing: reliable and best-effort, keep-last and keep-all, volatile and transient-local, fragments | ✓ (keyless topics) |
+| Subscribing to user topics | ✓ (keyless topics) |
 
 ## Using it
 
@@ -47,6 +55,28 @@ _ = p.Run(ctx)
 
 `discovery.SPDPObserver` does the participant part alone, sending nothing at
 all.
+
+Publishing and subscribing:
+
+```go
+w, _ := p.Publish(participant.Publication{
+	Topic: "rt/chatter", Type: "std_msgs::msg::dds_::String_",
+	QoS:   participant.WriterQoS{Reliability: rtps.Reliable, Depth: 10},
+})
+// payload: serialized, encapsulation header first (00 01 00 00: CDR little endian)
+_, _ = w.Write(payload)
+
+_ = p.Subscribe(participant.Subscription{
+	Topic: "rt/chatter", Type: "std_msgs::msg::dds_::String_",
+	QoS:   participant.ReaderQoS{Reliability: rtps.Reliable, Depth: 10},
+	Handle: func(writer rtps.GUID, s participant.Sample) { /* s.Payload */ },
+})
+```
+
+A reader takes what a writer sends only once it has learned of the writer
+itself. `Writer.Ready` names the readers known to have done so. A reliable
+reader is known once it has acknowledged anything. Wait for it before the
+first sample if that sample matters.
 
 Cyclone DDS announces `__Hostname`, `__Pid` and `__ProcessName` with each
 participant. The PID is in the sender's PID namespace: in a container it is not
@@ -110,8 +140,9 @@ state, and each writer's traffic as metrics.
   machine's participants are received — SPDP multicast reaches the socket — and
   ignored; they never learn of it. The E2E tests check this from the other
   machine with tcpdump.
-- **It only reads.** It announces readers, never writers, and publishes no
-  `ros_discovery_info`, so it is not a node: `ros2 node list` does not show it.
+- **It writes only when asked.** An observer announces readers and no
+  writers. Nothing publishes `ros_discovery_info`, so a participant is never a
+  ROS node: `ros2 node list` does not show it.
 - **It says goodbye.** On the way out it disposes itself, so peers forget it at
   once rather than when its lease (10 s) runs out.
 
@@ -122,10 +153,11 @@ state, and each writer's traffic as metrics.
 | [`rtps`](rtps) | messages, submessages, parameter lists; SPDP and SEDP data; writing messages |
 | [`transport`](transport) | the RTPS port mapping, multicast listening, interfaces |
 | [`discovery`](discovery) | participants (SPDP) and endpoints (SEDP), with events |
-| [`participant`](participant) | the participant: discovery on this host, reliable readers, subscriptions |
+| [`participant`](participant) | the participant: discovery on this host, reliable readers and writers, subscriptions and publications |
 | [`ros2`](ros2) | `ros_discovery_info`, the node graph, ROS names of DDS topics and types |
 | [`cdr`](cdr) | XCDR1 marshalling (from [lesomnus/cdr](https://github.com/lesomnus/cdr)) |
 | [`cmd/ddsspy`](cmd/ddsspy) | prints a domain's participants, endpoints and nodes as they come and go |
+| [`cmd/ddscat`](cmd/ddscat) | publishes to a topic, or prints what is published on one |
 
 ## Limits
 
@@ -134,8 +166,13 @@ state, and each writer's traffic as metrics.
   the standard.
 - UDP over IPv4, the default port mapping, no DDS Security, no shared memory.
   No XTypes type information is sent or required: Cyclone matches by type name.
-- A subscription matches writers on topic, type, reliability and durability.
-  Other QoS (deadline, ownership, partitions, ...) is reported, not enforced.
+- Endpoints match on topic, type, reliability and durability. Other QoS
+  (deadline, lifespan, ownership, partitions, ...) is reported, not enforced.
+- Topics are keyless: no keys, instances, dispose or unregister of samples.
+- Only participants on this host are talked to. A participant's own writers and
+  readers do not meet: it does not discover itself.
+- A writer does not wait. `Write` returns at once, and a full KEEP_ALL history
+  is an error rather than a block. There is no flow control.
 - Samples are limited to 1 MiB and 1024 ahead of the next in order.
 - Its vendor ID is the specification's "unknown" (00.00): it has none assigned.
 
