@@ -182,6 +182,19 @@ type SpyLine struct {
 	Lease       string    `json:"lease"`
 	From        string    `json:"from"`
 	Cyclone     string    `json:"cyclone"`
+
+	GUID        string `json:"guid"`
+	Kind        string `json:"kind"`
+	Topic       string `json:"topic"`
+	Type        string `json:"type"`
+	Reliability string `json:"reliability"`
+	Durability  string `json:"durability"`
+	History     string `json:"history"`
+	Depth       int32  `json:"depth"`
+
+	Node    string `json:"node"`
+	Readers int    `json:"readers"`
+	Writers int    `json:"writers"`
 }
 
 // Spy is ddsspy running on a host.
@@ -215,10 +228,23 @@ func (l *lockedBuffer) String() string {
 // Spy starts ddsspy on the host. local keeps only the host's participants.
 func (h *Host) Spy(t testing.TB, domain uint32, local bool) *Spy {
 	t.Helper()
-	args := []string{"exec", h.name, "/ddsspy", "-json", "-domain", fmt.Sprint(domain), "-iface", h.lan.subnet}
+	var flags []string
 	if local {
-		args = append(args, "-local")
+		flags = append(flags, "-local")
 	}
+	return h.spy(t, domain, flags...)
+}
+
+// Participant starts ddsspy -sedp -ros on the host: it takes part, and
+// reports endpoints and ROS nodes.
+func (h *Host) Participant(t testing.TB, domain uint32) *Spy {
+	t.Helper()
+	return h.spy(t, domain, "-sedp", "-ros")
+}
+
+func (h *Host) spy(t testing.TB, domain uint32, flags ...string) *Spy {
+	t.Helper()
+	args := append([]string{"exec", h.name, "/ddsspy", "-json", "-domain", fmt.Sprint(domain), "-iface", h.lan.subnet}, flags...)
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	s := &Spy{t: t, cancel: cancel, done: make(chan struct{})}
@@ -251,7 +277,10 @@ func (h *Host) Spy(t testing.TB, domain uint32, local bool) *Spy {
 		}
 	})
 	// Listening before the test starts anything.
-	s.WaitFor(10*time.Second, "ddsspy to listen", func([]SpyLine) bool { return strings.Contains(s.stderr.String(), "listening on") })
+	s.WaitFor(10*time.Second, "ddsspy to listen", func([]SpyLine) bool {
+		log := s.stderr.String()
+		return strings.Contains(log, "listening on") || strings.Contains(log, "participant ")
+	})
 	return s
 }
 
@@ -286,4 +315,84 @@ func Find(lines []SpyLine, event, process string) (SpyLine, bool) {
 		}
 	}
 	return SpyLine{}, false
+}
+
+// Stderr is what ddsspy has logged.
+func (s *Spy) Stderr() string { return s.stderr.String() }
+
+// Stop ends ddsspy gracefully and waits for it.
+func (s *Spy) Stop(h *Host) {
+	_ = exec.Command("docker", "exec", h.name, "pkill", "-INT", "-f", "/ddsspy").Run()
+	select {
+	case <-s.done:
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// Python runs a Python program with rclpy on the host, as a ROS 2 process.
+func (h *Host) Python(t testing.TB, domain uint32, program string) *Process {
+	t.Helper()
+	return h.Run(t, domain, "python3", "-u", "-c", program)
+}
+
+// CLI runs the ros2 command line on the host, as its own short-lived
+// process, and returns what it prints.
+func (h *Host) CLI(t testing.TB, domain uint32, args ...string) string {
+	t.Helper()
+	cmd := []string{"run", "--rm", "--network", "container:" + h.name,
+		"-e", fmt.Sprintf("ROS_DOMAIN_ID=%d", domain), image(), "ros2"}
+	return docker(t, append(cmd, args...)...)
+}
+
+// Capture runs tcpdump on the host until stop is called, then returns the
+// packets it saw, one line each.
+func (h *Host) Capture(t testing.TB, filter string) (stop func() []string) {
+	t.Helper()
+	docker(t, "exec", "-d", h.name, "sh", "-c", "tcpdump -i any -nn -l "+filter+" > /capture.txt 2>/capture.err")
+	time.Sleep(time.Second) // tcpdump attaching
+	return func() []string {
+		_ = exec.Command("docker", "exec", h.name, "pkill", "-INT", "tcpdump").Run()
+		time.Sleep(500 * time.Millisecond)
+		out := docker(t, "exec", h.name, "cat", "/capture.txt")
+		if out == "" {
+			return nil
+		}
+		return strings.Split(out, "\n")
+	}
+}
+
+// Addr is the host's address on its LAN.
+func (h *Host) Addr(t testing.TB) string {
+	t.Helper()
+	return docker(t, "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", h.name)
+}
+
+// FindTopic returns the lines of the event for a topic and endpoint kind.
+func FindTopic(lines []SpyLine, event, topic, kind string) []SpyLine {
+	var out []SpyLine
+	for _, l := range lines {
+		if l.Event == event && l.Topic == topic && l.Kind == kind {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// Nodes returns the nodes appeared and not disappeared, by full name.
+func Nodes(lines []SpyLine) map[string]SpyLine {
+	out := map[string]SpyLine{}
+	for _, l := range lines {
+		key := l.Node + " " + l.GUIDPrefix
+		switch l.Event {
+		case "node_appeared", "node_updated":
+			out[key] = l
+		case "node_disappeared":
+			delete(out, key)
+		}
+	}
+	names := map[string]SpyLine{}
+	for _, l := range out {
+		names[l.Node] = l
+	}
+	return names
 }
