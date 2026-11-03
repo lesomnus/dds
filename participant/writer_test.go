@@ -140,7 +140,7 @@ func (l *link) payloads() []int {
 
 func TestReliableInOrder(t *testing.T) {
 	l := newLink(t, writerConfig{reliable: true, depth: 10})
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	for i := 1; i <= 5; i++ {
 		l.write(sample(i, 32))
 	}
@@ -158,7 +158,7 @@ func TestReliableInOrder(t *testing.T) {
 func TestReliableUnderLoss(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	l := newLink(t, writerConfig{reliable: true, depth: 100})
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	l.drop = func([]byte) bool { return rng.Float64() < 0.4 }
 	for i := 1; i <= 50; i++ {
 		l.write(sample(i, 32))
@@ -179,7 +179,7 @@ func TestReliableUnderLoss(t *testing.T) {
 
 func TestKeepLastGapsWhatIsGone(t *testing.T) {
 	l := newLink(t, writerConfig{reliable: true, depth: 3})
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	lost := true
 	l.drop = func([]byte) bool { return lost }
 	for i := 1; i <= 8; i++ {
@@ -198,27 +198,31 @@ func TestKeepLastGapsWhatIsGone(t *testing.T) {
 }
 
 func TestDurability(t *testing.T) {
-	for _, tl := range []bool{false, true} {
-		l := newLink(t, writerConfig{reliable: true, transientLocal: tl, depth: 2})
+	for _, c := range []struct {
+		writer, reader bool // transient local
+		want           string
+	}{
+		{false, false, "[5]"},
+		{false, true, "[5]"},    // (not matched in DDS; the engine sends no history all the same)
+		{true, false, "[5]"},    // a volatile reader: nothing from before
+		{true, true, "[3 4 5]"}, // the history of two, then the new one
+	} {
+		l := newLink(t, writerConfig{reliable: true, transientLocal: c.writer, depth: 2})
 		for i := 1; i <= 4; i++ {
 			l.write(sample(i, 32)) // nobody matched yet
 		}
-		l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+		l.deliver(l.w.addReader(rGUID, addr, true, c.reader, l.now))
 		l.write(sample(5, 32))
 		l.tick()
-		want := "[5]"
-		if tl {
-			want = "[3 4 5]" // the history of two, then the new one
-		}
-		if got := fmt.Sprint(l.payloads()); got != want {
-			t.Errorf("transient local %v: got %s, want %s", tl, got, want)
+		if got := fmt.Sprint(l.payloads()); got != c.want {
+			t.Errorf("writer transient local %v, reader %v: got %s, want %s", c.writer, c.reader, got, c.want)
 		}
 	}
 }
 
 func TestBestEffortReaderGetsNoHeartbeats(t *testing.T) {
 	l := newLink(t, writerConfig{reliable: true, depth: 2})
-	if out := l.w.addReader(rGUID, addr, false, l.now); len(out) != 0 {
+	if out := l.w.addReader(rGUID, addr, false, false, l.now); len(out) != 0 {
 		t.Errorf("%d messages on a best-effort match", len(out))
 	}
 	_, out, _ := l.w.write(change{at: l.now, payload: sample(1, 8)})
@@ -239,7 +243,7 @@ func TestBestEffortReaderGetsNoHeartbeats(t *testing.T) {
 func TestFragmentsUnderLoss(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
 	l := newLink(t, writerConfig{reliable: true, depth: 4})
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	big := sample(7, 200_000) // 13 fragments, 5 datagrams
 	l.drop = func([]byte) bool { return rng.Float64() < 0.3 }
 	l.write(big)
@@ -262,7 +266,7 @@ func TestFragmentsUnderLoss(t *testing.T) {
 
 func TestKeepAllFull(t *testing.T) {
 	l := newLink(t, writerConfig{reliable: true, keepAll: true, maxSamples: 3})
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	l.drop = func([]byte) bool { return true } // nothing is acknowledged
 	for i := 1; i <= 3; i++ {
 		l.write(sample(i, 8))
@@ -300,7 +304,7 @@ func TestHeartbeatsUntilTheReaderAnswers(t *testing.T) {
 	// The reader does not know the writer yet: it ignores everything.
 	deaf := true
 	l.drop = func([]byte) bool { return deaf }
-	l.deliver(l.w.addReader(rGUID, addr, true, l.now))
+	l.deliver(l.w.addReader(rGUID, addr, true, false, l.now))
 	if len(l.w.ready()) != 0 {
 		t.Error("ready before it answered")
 	}
@@ -332,7 +336,7 @@ func FuzzStateWriter(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		w := newStateWriter(wPrefix, writerConfig{id: wID, reliable: true, depth: 3})
 		now := time.Unix(1_800_000_000, 0)
-		w.addReader(rGUID, addr, true, now)
+		w.addReader(rGUID, addr, true, false, now)
 		for i := 1; i <= 4; i++ {
 			w.write(change{at: now, payload: sample(i, 70_000)})
 		}

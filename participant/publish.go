@@ -187,7 +187,7 @@ func (p *Participant) matchOneReader(w *Writer, ep *discovery.Endpoint, at time.
 	if !ok {
 		return nil
 	}
-	return w.w.addReader(ep.GUID, p.userAddrs(pe, ep), ep.QoS.Reliability == rtps.Reliable, at)
+	return w.w.addReader(ep.GUID, p.userAddrs(pe, ep), ep.QoS.Reliability == rtps.Reliable, ep.QoS.Durability >= rtps.TransientLocal, at)
 }
 
 // matchReader matches a newly discovered reader with every writer. Called
@@ -209,10 +209,10 @@ func (p *Participant) matchBuiltin(pe *peer) {
 	p.mu.Lock()
 	prefix := pe.data.GUID.Prefix
 	if pe.data.BuiltinEndpoints&rtps.BuiltinPublicationsDetector != 0 {
-		out = append(out, p.pubsW.addReader(rtps.GUID{Prefix: prefix, Entity: rtps.EntitySEDPPublicationsReader}, pe.metatraffic, true, now)...)
+		out = append(out, p.pubsW.addReader(rtps.GUID{Prefix: prefix, Entity: rtps.EntitySEDPPublicationsReader}, pe.metatraffic, true, true, now)...)
 	}
 	if pe.data.BuiltinEndpoints&rtps.BuiltinSubscriptionsDetector != 0 {
-		out = append(out, p.subsW.addReader(rtps.GUID{Prefix: prefix, Entity: rtps.EntitySEDPSubscriptionsReader}, pe.metatraffic, true, now)...)
+		out = append(out, p.subsW.addReader(rtps.GUID{Prefix: prefix, Entity: rtps.EntitySEDPSubscriptionsReader}, pe.metatraffic, true, true, now)...)
 	}
 	p.mu.Unlock()
 	p.sendAll(out)

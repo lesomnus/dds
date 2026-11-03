@@ -204,20 +204,22 @@ func (w *stateWriter) sortedReaders() []*readerProxy {
 	return out
 }
 
-// addReader matches a reader. A transient-local writer sends it its history;
-// a volatile one only what it writes from now on.
-func (w *stateWriter) addReader(guid rtps.GUID, addrs []netip.AddrPort, reliable bool, at time.Time) []outbound {
+// addReader matches a reader. A transient-local writer sends a
+// transient-local reader its history; any other reader gets only what is
+// written from now on.
+func (w *stateWriter) addReader(guid rtps.GUID, addrs []netip.AddrPort, reliable, transientLocal bool, at time.Time) []outbound {
 	if _, ok := w.readers[guid]; ok {
 		return nil
 	}
+	history := w.cfg.transientLocal && transientLocal
 	r := &readerProxy{guid: guid, addrs: addrs, reliable: reliable, start: w.last + 1}
-	if w.cfg.transientLocal {
+	if history {
 		r.start = 1
 	}
 	r.acked = r.start
 	w.readers[guid] = r
 	var out []outbound
-	if w.cfg.transientLocal {
+	if history {
 		for _, c := range w.history {
 			for _, m := range w.dataMessages(r, c) {
 				out = append(out, outbound{to: addrs, msg: m})
