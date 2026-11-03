@@ -13,7 +13,7 @@ for monitoring. It is tested against [Cyclone DDS](https://cyclonedds.io)
 | SPDP: participants discovered, updated, lost — disposed, or lease expired | ✓ |
 | SEDP: every endpoint's topic, type and QoS | ✓ |
 | `ros_discovery_info`: ROS nodes, several to a process, and their endpoints | ✓ |
-| Reliable reading: ordering, gaps, heartbeats, fragments, loss | ✓ |
+| Reliable reading: ordering, gaps, heartbeats, fragments (NACK_FRAG), loss | ✓ |
 | Publishing user data | — not a goal |
 
 ## Using it
@@ -99,8 +99,7 @@ $ ddsspy -domain 138 -iface 192.168.10.0/24 -sedp -ros      # endpoints and node
   No XTypes type information is sent or required: Cyclone matches by type name.
 - A subscription matches writers on topic, type, reliability and durability.
   Other QoS (deadline, ownership, partitions, ...) is reported, not enforced.
-- Fragments are asked for again whole (no NACK_FRAG); samples are limited to
-  1 MiB and 1024 ahead of the next in order.
+- Samples are limited to 1 MiB and 1024 ahead of the next in order.
 - Its vendor ID is the specification's "unknown" (00.00): it has none assigned.
 
 ## Cost
@@ -121,6 +120,7 @@ The E2E tests run ROS 2 processes and the observer in containers sharing a
 network namespace (one machine), on Docker networks (one LAN), so the Docker
 daemon need not be local. They compare what is observed with `ros2 topic info
 -v` and `ros2 node list`, stop and kill processes, destroy nodes in a live one,
-put thirty nodes in one process (fragmented samples), degrade the host's
+put thirty nodes in one process (fragmented samples, sent live and as
+history to a reader that joins late), degrade the host's
 loopback with `tc netem` (20 % loss, duplication, reordering, delay), and watch
 from a second machine that nothing reaches it.

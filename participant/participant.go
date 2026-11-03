@@ -529,6 +529,10 @@ func (p *Participant) handleUnicast(from netip.AddrPort, b []byte) {
 			if g, err := rtps.ParseGap(s); err == nil {
 				p.onGap(src, g)
 			}
+		case rtps.SubHeartbeatFrg:
+			if h, err := rtps.ParseHeartbeatFrag(s); err == nil {
+				p.onHeartbeatFrag(src, h)
+			}
 		case rtps.SubAckNack:
 			if a, err := rtps.ParseAckNack(s); err == nil {
 				p.onAckNack(src, a)
@@ -606,12 +610,17 @@ func (p *Participant) onHeartbeat(src rtps.GUIDPrefix, h rtps.Heartbeat) {
 	pe, w, deliver := p.route(src, h.Writer)
 	var ss []Sample
 	var ack *rtps.SequenceNumberSet
+	var nacks []fragNack
 	var count int32
+	var nackCounts []int32
 	reader := h.Reader
 	if w != nil {
-		ss, ack = w.heartbeat(h)
+		ss, ack, nacks = w.heartbeat(h)
 		if ack != nil {
 			count = w.nextAckCount()
+		}
+		for range nacks {
+			nackCounts = append(nackCounts, w.nextNackCount())
 		}
 		reader = p.readerFor(src, h.Writer, h.Reader)
 	}
@@ -623,12 +632,33 @@ func (p *Participant) onHeartbeat(src rtps.GUIDPrefix, h rtps.Heartbeat) {
 		p.mu.Lock()
 		to := p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
 		p.mu.Unlock()
-		msg := rtps.NewBuilder(p.prefix, VendorID).
-			InfoDst(src).
-			AckNack(reader, h.Writer, *ack, count, false).
-			Bytes()
-		p.send(to, msg)
+		b := rtps.NewBuilder(p.prefix, VendorID).InfoDst(src)
+		for i, n := range nacks {
+			b.NackFrag(reader, h.Writer, n.SN, n.Missing, nackCounts[i])
+		}
+		b.AckNack(reader, h.Writer, *ack, count, false)
+		p.send(to, b.Bytes())
 	}
+}
+
+func (p *Participant) onHeartbeatFrag(src rtps.GUIDPrefix, h rtps.HeartbeatFrag) {
+	p.mu.Lock()
+	pe, w, _ := p.route(src, h.Writer)
+	if w == nil {
+		p.mu.Unlock()
+		return
+	}
+	n := w.heartbeatFrag(h)
+	if n == nil {
+		p.mu.Unlock()
+		return
+	}
+	count := w.nextNackCount()
+	reader := p.readerFor(src, h.Writer, h.Reader)
+	to := p.replyTo(pe, rtps.GUID{Prefix: src, Entity: h.Writer})
+	p.mu.Unlock()
+	msg := rtps.NewBuilder(p.prefix, VendorID).InfoDst(src).NackFrag(reader, h.Writer, n.SN, n.Missing, count).Bytes()
+	p.send(to, msg)
 }
 
 // readerFor is our reader that reads a writer: an SEDP reader, or a user

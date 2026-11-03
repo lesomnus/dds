@@ -172,6 +172,12 @@ func FuzzParse(f *testing.F) {
 				}
 			case rtps.SubDataFrag:
 				_, _ = rtps.ParseDataFrag(s)
+			case rtps.SubHeartbeatFrg:
+				_, _ = rtps.ParseHeartbeatFrag(s)
+			case rtps.SubNackFrag:
+				if n, err := rtps.ParseNackFrag(s); err == nil {
+					_ = n.Missing.Members()
+				}
 			case rtps.SubHeartbeat:
 				_, _ = rtps.ParseHeartbeat(s)
 			case rtps.SubAckNack:

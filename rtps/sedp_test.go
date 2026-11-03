@@ -222,3 +222,23 @@ func TestBuiltMessagesParse(t *testing.T) {
 		t.Errorf("acknack %+v", a)
 	}
 }
+
+func TestNackFragRoundTrip(t *testing.T) {
+	var set rtps.FragmentNumberSet
+	set.Base = 2
+	set.Add(2)
+	set.Add(5)
+	b := rtps.NewBuilder(rtps.GUIDPrefix{1}, rtps.VendorUnknown).
+		NackFrag(rtps.EntityID{0, 0, 1, 4}, rtps.EntityID{0, 0, 4, 3}, 9, set, 3).Bytes()
+	m, err := rtps.Parse(b)
+	if err != nil || len(m.Submessages) != 1 {
+		t.Fatal(err)
+	}
+	n, err := rtps.ParseNackFrag(m.Submessages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.SN != 9 || n.Count != 3 || len(n.Missing.Members()) != 2 || n.Missing.Members()[1] != 5 {
+		t.Errorf("%+v", n)
+	}
+}
