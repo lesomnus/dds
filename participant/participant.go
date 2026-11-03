@@ -1,10 +1,14 @@
-// Package participant is a DDS participant that observes: it discovers the
-// participants it is allowed to talk to (SPDP), learns their endpoints
-// (SEDP), and subscribes to the topics it is asked to, reading reliably.
+// Package participant is a DDS participant: it discovers the participants
+// it is allowed to talk to (SPDP), learns their endpoints (SEDP), subscribes
+// to the topics it is asked to and publishes on those it is asked to,
+// reliably or not.
 //
 // It talks only to participants its filter keeps, and only by unicast to
-// addresses of this host: it announces itself to no one else. It publishes no
-// user data.
+// addresses of this host: it announces itself to no one else. A participant
+// that only subscribes publishes nothing but its discovery.
+//
+// Payloads are the user's: serialized, encapsulation header first, as they
+// go on the wire. Topics are keyless.
 package participant
 
 import (
@@ -73,12 +77,11 @@ type Participant struct {
 	peers     map[rtps.GUIDPrefix]*peer
 	endpoints map[rtps.GUID]*discovery.Endpoint
 	readers   map[rtps.EntityID]*userReader
+	writers   map[rtps.EntityID]*Writer
 	sent      map[netip.AddrPort]int64
 	nextKey   uint32
-	// subs is our SEDP subscriptions writer's history: the announcement of
-	// reader i is sequence number i+1. subHB counts its heartbeats.
-	subs  [][]byte
-	subHB int32
+	// Our SEDP writers: the announcements of our writers and readers.
+	pubsW, subsW *stateWriter
 }
 
 // peer is a remote participant we talk to.
@@ -91,8 +94,6 @@ type peer struct {
 	proxies map[rtps.GUID]*writerProxy
 	// announced: we have told it of ourselves at least once.
 	announced bool
-	// subsAcked: it has every reader announcement before this number.
-	subsAcked rtps.SequenceNumber
 }
 
 // New opens the participant's sockets. Run starts it.
@@ -134,12 +135,18 @@ func New(cfg Config, events func(discovery.Event)) (*Participant, error) {
 		peers:     map[rtps.GUIDPrefix]*peer{},
 		endpoints: map[rtps.GUID]*discovery.Endpoint{},
 		readers:   map[rtps.EntityID]*userReader{},
+		writers:   map[rtps.EntityID]*Writer{},
 		sent:      map[netip.AddrPort]int64{},
 		nextKey:   1,
 	}
 	if _, err := rand.Read(p.prefix[:]); err != nil {
 		return nil, err
 	}
+	sedp := writerConfig{reliable: true, transientLocal: true, keyed: true}
+	sedp.id = rtps.EntitySEDPPublicationsWriter
+	p.pubsW = newStateWriter(p.prefix, sedp)
+	sedp.id = rtps.EntitySEDPSubscriptionsWriter
+	p.subsW = newStateWriter(p.prefix, sedp)
 
 	conn, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(cfg.Addr, 0)))
 	if err != nil {
@@ -251,8 +258,10 @@ func (p *Participant) receiveUnicast(ctx context.Context) error {
 func (p *Participant) tick(ctx context.Context) {
 	announce := time.NewTicker(p.cfg.AnnounceInterval)
 	lease := time.NewTicker(time.Second)
+	heartbeat := time.NewTicker(heartbeatPeriod / 2)
 	defer announce.Stop()
 	defer lease.Stop()
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -261,6 +270,8 @@ func (p *Participant) tick(ctx context.Context) {
 			p.spdp.CheckLeases()
 		case <-announce.C:
 			p.announceAll()
+		case <-heartbeat.C:
+			p.heartbeatWriters()
 		}
 	}
 }
@@ -277,7 +288,7 @@ func (p *Participant) onSPDP(e discovery.Event) {
 		if pe != nil {
 			p.announce(pe)
 			p.greet(pe)
-			p.sendSubscriptions(pe, nil)
+			p.matchBuiltin(pe)
 		}
 	case discovery.ParticipantUpdated:
 		p.emit(e)
@@ -290,6 +301,11 @@ func (p *Participant) onSPDP(e discovery.Event) {
 	case discovery.ParticipantLost:
 		p.mu.Lock()
 		delete(p.peers, e.Participant.GUID.Prefix)
+		p.pubsW.removeParticipant(e.Participant.GUID.Prefix)
+		p.subsW.removeParticipant(e.Participant.GUID.Prefix)
+		for _, w := range p.writers {
+			w.w.removeParticipant(e.Participant.GUID.Prefix)
+		}
 		var lost []discovery.Event
 		for g, ep := range p.endpoints {
 			if ep.Participant == e.Participant.GUID.Prefix {
@@ -314,7 +330,7 @@ func (p *Participant) addPeer(d discovery.Participant) *peer {
 		p.log.Debug("participant has no local metatraffic address; not talking to it", "guid", d.GUID.Prefix)
 		return nil
 	}
-	pe := &peer{data: d, metatraffic: meta, proxies: map[rtps.GUID]*writerProxy{}, subsAcked: 1}
+	pe := &peer{data: d, metatraffic: meta, proxies: map[rtps.GUID]*writerProxy{}}
 	p.peers[d.GUID.Prefix] = pe
 	return pe
 }
@@ -354,12 +370,11 @@ func (p *Participant) emit(e discovery.Event) {
 	}
 }
 
-// builtinEndpoints is what we have: SPDP both ways, the SEDP detectors, and
-// the subscriptions announcer once there are readers to announce.
+// builtinEndpoints is what we have: SPDP and SEDP, both ways.
 func (p *Participant) builtinEndpoints() uint32 {
 	return rtps.BuiltinParticipantAnnouncer | rtps.BuiltinParticipantDetector |
 		rtps.BuiltinPublicationsDetector | rtps.BuiltinSubscriptionsDetector |
-		rtps.BuiltinSubscriptionsAnnouncer
+		rtps.BuiltinPublicationsAnnouncer | rtps.BuiltinSubscriptionsAnnouncer
 }
 
 // spdpPayload is what we announce of ourselves.
@@ -413,7 +428,6 @@ func (p *Participant) announceAll() {
 	for _, pe := range peers {
 		p.send(pe.metatraffic, msg)
 		p.greet(pe)
-		p.heartbeatSubscriptions(pe)
 	}
 }
 
@@ -536,6 +550,10 @@ func (p *Participant) handleUnicast(from netip.AddrPort, b []byte) {
 		case rtps.SubAckNack:
 			if a, err := rtps.ParseAckNack(s); err == nil {
 				p.onAckNack(src, a)
+			}
+		case rtps.SubNackFrag:
+			if n, err := rtps.ParseNackFrag(s); err == nil {
+				p.onNackFrag(src, n)
 			}
 		}
 	}
@@ -684,6 +702,7 @@ func (p *Participant) onSEDP(pe *peer, kind rtps.EndpointKind, ss []Sample) {
 	now := p.cfg.Now()
 	var evs []discovery.Event
 	var nudges []matchNudge
+	var out []outbound
 	p.mu.Lock()
 	for _, s := range ss {
 		if guid, ok := disposedEndpoint(s); ok {
@@ -715,6 +734,7 @@ func (p *Participant) onSEDP(pe *peer, kind rtps.EndpointKind, ss []Sample) {
 		case !ok:
 			evs = append(evs, discovery.EndpointDiscovered{Endpoint: *ep})
 			nudges = append(nudges, p.match(ep)...)
+			out = append(out, p.matchReader(ep)...)
 		case !discovery.SameEndpoint(&prev.EndpointData, &ed):
 			evs = append(evs, discovery.EndpointUpdated{Endpoint: *ep})
 		}
@@ -724,6 +744,7 @@ func (p *Participant) onSEDP(pe *peer, kind rtps.EndpointKind, ss []Sample) {
 		p.emit(e)
 	}
 	p.nudge(nudges)
+	p.sendAll(out)
 }
 
 // disposedEndpoint reports the endpoint a disposing or unregistering sample

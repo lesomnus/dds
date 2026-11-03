@@ -128,6 +128,58 @@ func (w *Builder) NackFrag(reader, writer EntityID, sn SequenceNumber, missing F
 	return w
 }
 
+// Gap appends a GAP: the numbers from start up to list.Base-1, and those in
+// list, are irrelevant to the reader -- it will not get them.
+func (w *Builder) Gap(reader, writer EntityID, start SequenceNumber, list SequenceNumberSet) *Builder {
+	body := make([]byte, 0, 60)
+	body = append(body, reader[:]...)
+	body = append(body, writer[:]...)
+	body = appendSN(body, le, start)
+	body = appendSNSet(body, le, list)
+	w.sub(SubGap, 0, body)
+	return w
+}
+
+// DataFrag appends a DATA_FRAG: fragments start, start+1, ... of a sample of
+// sampleSize octets cut in fragSize ones; frags is their bytes, in order (the
+// last fragment may be short).
+func (w *Builder) DataFrag(reader, writer EntityID, sn SequenceNumber, start uint32, count uint16, fragSize uint16, sampleSize uint32, inlineQoS, frags []byte) *Builder {
+	body := make([]byte, 0, 32+len(inlineQoS)+len(frags)+3)
+	body = append(body, 0, 0)        // extraFlags
+	body = le.AppendUint16(body, 28) // octetsToInlineQos: to after sampleSize
+	body = append(body, reader[:]...)
+	body = append(body, writer[:]...)
+	body = appendSN(body, le, sn)
+	body = le.AppendUint32(body, start)
+	body = le.AppendUint16(body, count)
+	body = le.AppendUint16(body, fragSize)
+	body = le.AppendUint32(body, sampleSize)
+	var flags byte
+	if inlineQoS != nil {
+		flags |= DataFlagInlineQoS
+		body = append(body, inlineQoS...)
+	}
+	body = append(body, frags...)
+	for len(body)%4 != 0 {
+		body = append(body, 0)
+	}
+	w.sub(SubDataFrag, flags, body)
+	return w
+}
+
+// HeartbeatFrag appends a HEARTBEAT_FRAG: the writer has fragments 1..last
+// of sample sn.
+func (w *Builder) HeartbeatFrag(reader, writer EntityID, sn SequenceNumber, last uint32, count int32) *Builder {
+	body := make([]byte, 0, 24)
+	body = append(body, reader[:]...)
+	body = append(body, writer[:]...)
+	body = appendSN(body, le, sn)
+	body = le.AppendUint32(body, last)
+	body = le.AppendUint32(body, uint32(count))
+	w.sub(SubHeartbeatFrg, 0, body)
+	return w
+}
+
 // ParameterListWriter encodes a parameter list (PL_CDR_LE).
 type ParameterListWriter struct {
 	b []byte
