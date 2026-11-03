@@ -340,3 +340,5 @@ func ReadStatusInfo(b []byte) (uint32, error) {
 	}
 	return binary.BigEndian.Uint32(b[0:4]), nil
 }
+
+func errorf(s string) error { return errors.New(s) }
