@@ -338,27 +338,3 @@ func (s *Stats) Forget(g rtps.GUID) {
 		}
 	}
 }
-
-// Prune drops the writers drop says to, and the reader pairs that name
-// them: writers of participants gone without a word, say.
-func (s *Stats) Prune(drop func(Writer) bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	gone := map[rtps.GUID]bool{}
-	for g, w := range s.writers {
-		if drop(w.Writer) {
-			delete(s.writers, g)
-			gone[g] = true
-		}
-	}
-	if len(gone) == 0 {
-		return
-	}
-	for _, m := range []map[readerKey]int32{s.acks, s.nacks} {
-		for k := range m {
-			if gone[k.writer] {
-				delete(m, k)
-			}
-		}
-	}
-}

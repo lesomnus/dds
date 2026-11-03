@@ -193,13 +193,3 @@ func BenchmarkObserve(b *testing.B) {
 		s.Observe(msgs[i%len(msgs)], t0)
 	}
 }
-
-func TestPrune(t *testing.T) {
-	s := NewStats()
-	s.Observe(data(1, 10), t0)
-	s.Observe(rtps.NewBuilder(subPrefix, vendor).Data(userR, userW, 1, nil, payload(10), false).Bytes(), t0.Add(time.Minute))
-	s.Prune(func(w Writer) bool { return w.LastSeen.Before(t0.Add(time.Second)) })
-	if ws := s.Writers(); len(ws) != 1 || ws[0].GUID.Prefix != subPrefix {
-		t.Errorf("%+v", ws)
-	}
-}

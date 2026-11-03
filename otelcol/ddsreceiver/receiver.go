@@ -319,15 +319,17 @@ func (r *ddsReceiver) send(ctx context.Context) {
 func (r *ddsReceiver) sendTraffic(ctx context.Context) {
 	now := r.now()
 	quiet := now.Add(-2 * time.Minute)
-	r.stats.Prune(func(w traffic.Writer) bool {
-		return w.LastSeen.Before(quiet) && !r.state.isLocal(w.GUID.Prefix)
-	})
+	ws := r.stats.Writers()
+	for _, w := range ws {
+		if w.LastSeen.Before(quiet) && !r.state.isLocal(w.GUID.Prefix) {
+			r.stats.Forget(w.GUID)
+		}
+	}
 	m := r.metricsConsumer()
 	if m == nil {
 		return
 	}
-	ws := r.state.localWriters(r.stats.Writers())
-	if err := m.ConsumeMetrics(ctx, trafficMetrics(now, r.began, ws, r.capture.Drops(), r.cfg.ROS)); err != nil {
+	if err := m.ConsumeMetrics(ctx, trafficMetrics(now, r.began, r.state.localWriters(ws), r.capture.Drops(), r.cfg.ROS)); err != nil {
 		r.logger.Debug("metrics not consumed", zap.Error(err))
 	}
 }
