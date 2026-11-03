@@ -199,6 +199,14 @@ type SpyLine struct {
 	Node    string `json:"node"`
 	Readers int    `json:"readers"`
 	Writers int    `json:"writers"`
+
+	Interval           string  `json:"interval"`
+	Samples            int64   `json:"samples"`
+	Rate               float64 `json:"rate"`
+	Bytes              int64   `json:"bytes"`
+	RetransmitRequests int64   `json:"retransmit_requests"`
+	FragmentRequests   int64   `json:"fragment_requests"`
+	Drops              uint64  `json:"drops"`
 }
 
 // Spy is ddsspy running on a host.
@@ -244,6 +252,13 @@ func (h *Host) Spy(t testing.TB, domain uint32, local bool) *Spy {
 func (h *Host) Participant(t testing.TB, domain uint32) *Spy {
 	t.Helper()
 	return h.spy(t, domain, "-sedp", "-ros")
+}
+
+// Traffic starts ddsspy -sedp -traffic on the host: it also reports how much
+// each local writer writes, every interval.
+func (h *Host) Traffic(t testing.TB, domain uint32, every time.Duration) *Spy {
+	t.Helper()
+	return h.spy(t, domain, "-sedp", "-traffic", every.String())
 }
 
 func (h *Host) spy(t testing.TB, domain uint32, flags ...string) *Spy {

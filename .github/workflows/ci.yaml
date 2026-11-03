@@ -21,6 +21,7 @@ jobs:
       - run: go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 30s ./rtps/
       - run: go test -run '^$' -fuzz '^FuzzWriterProxy$' -fuzztime 30s ./participant/
       - run: go test -run '^$' -fuzz '^FuzzParseParticipantEntitiesInfo$' -fuzztime 30s ./ros2/
+      - run: go test -run '^$' -fuzz '^FuzzObserve$' -fuzztime 30s ./traffic/
 
   e2e:
     # Against Cyclone DDS 0.10.x as ROS 2 Jazzy runs it (rmw_cyclonedds_cpp).
