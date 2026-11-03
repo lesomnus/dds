@@ -140,7 +140,7 @@ func (p *Participant) matchOne(r *userReader, ep *discovery.Endpoint) (matchNudg
 		return matchNudge{}, false
 	}
 	r.matched[ep.GUID] = true
-	w := p.proxy(pe, ep.GUID)
+	w := p.proxy(pe, r.id, ep.GUID)
 	return matchNudge{
 		to: p.userAddrs(pe, ep), dst: ep.Participant, reader: r.id, writer: ep.GUID.Entity,
 		set: w.preemptive(), count: w.nextAckCount(),
@@ -169,7 +169,11 @@ func (p *Participant) unmatch(ep *discovery.Endpoint) {
 		delete(r.matched, ep.GUID)
 	}
 	if pe, ok := p.peers[ep.Participant]; ok {
-		delete(pe.proxies, ep.GUID)
+		for k := range pe.proxies {
+			if k.writer == ep.GUID {
+				delete(pe.proxies, k)
+			}
+		}
 	}
 }
 

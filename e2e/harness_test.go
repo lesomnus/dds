@@ -147,6 +147,19 @@ func (l *LAN) NewHost(t testing.TB) *Host {
 	return h
 }
 
+// Attach connects the host to another LAN too: a second interface (eth1,
+// then eth2, ...).
+func (l *LAN) Attach(t testing.TB, h *Host) {
+	t.Helper()
+	docker(t, "network", "connect", l.name, h.name)
+}
+
+// AddrOn is the host's address on a LAN.
+func (h *Host) AddrOn(t testing.TB, l *LAN) string {
+	t.Helper()
+	return docker(t, "inspect", "-f", "{{(index .NetworkSettings.Networks \""+l.name+"\").IPAddress}}", h.name)
+}
+
 // Process is a ROS 2 process on a Host, in its own container.
 type Process struct {
 	t    testing.TB

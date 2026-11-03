@@ -1,16 +1,8 @@
 package participant
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"net"
 	"net/netip"
-	"sync"
-	"syscall"
-	"time"
-
-	"golang.org/x/net/ipv4"
 
 	"github.com/lesomnus/dds/rtps"
 	"github.com/lesomnus/dds/transport"
@@ -55,10 +47,6 @@ const (
 	PortsWellKnown
 )
 
-// maxParticipantIndex bounds the indexes of a domain: their ports stay
-// below the next domain's.
-const maxParticipantIndex = (transport.DomainGain - 10) / transport.ParticipantGain
-
 // peerIndexes are the participant indexes whose ports a Peer is sent SPDP
 // to, besides its SPDP port.
 const peerIndexes = 5
@@ -74,58 +62,6 @@ const (
 	// INFO_DST, INFO_TS, the DATA(_FRAG) and a HEARTBEAT.
 	messageOverhead = 128
 )
-
-// listen opens the participant's unicast socket, by its port policy.
-func (p *Participant) listen() (*net.UDPConn, error) {
-	ports := p.cfg.Ports
-	if ports == PortsDefault {
-		ports = PortsEphemeral
-		if p.cfg.Scope == ScopeNetwork {
-			ports = PortsWellKnown
-		}
-	}
-	if ports == PortsEphemeral {
-		p.index = -1
-		return net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(p.cfg.Addr, 0)))
-	}
-	for i := 0; i < maxParticipantIndex; i++ {
-		port := transport.MetatrafficUnicastPort(p.cfg.Domain, uint32(i))
-		c, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(p.cfg.Addr, port)))
-		if err == nil {
-			p.index = i
-			return c, nil
-		}
-		if !errors.Is(err, syscall.EADDRINUSE) {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("participant: every participant index of domain %d is taken", p.cfg.Domain)
-}
-
-// ParticipantIndex is the index whose port the participant took, or -1.
-func (p *Participant) ParticipantIndex() int { return p.index }
-
-// interfaceNets are the subnets of an interface's IPv4 addresses.
-func interfaceNets(ifi *net.Interface) []netip.Prefix {
-	addrs, err := ifi.Addrs()
-	if err != nil {
-		return nil
-	}
-	var out []netip.Prefix
-	for _, a := range addrs {
-		n, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip, ok := netip.AddrFromSlice(n.IP)
-		if !ok || !ip.Unmap().Is4() {
-			continue
-		}
-		bits, _ := n.Mask.Size()
-		out = append(out, netip.PrefixFrom(ip.Unmap(), bits).Masked())
-	}
-	return out
-}
 
 // onNetwork reports whether an address is on the interface's network: in
 // one of its subnets, or a peer.
@@ -149,27 +85,48 @@ func (p *Participant) allowed(a netip.Addr) bool {
 	return a == transport.DefaultMulticastGroup || p.onNetwork(a)
 }
 
-// reachable keeps the UDPv4 locators of a participant that the scope lets
-// us send to. A participant on this host (its packets come from an address
-// of this host) is reached at addresses of this host. One elsewhere is
-// reached on the network -- not at any address it shares with this host,
-// like a docker bridge's every host has.
+// reachable is where to reach a participant among its locators: the one
+// the scope lets us send to that is best placed, or none. A participant on
+// this host (its packets come from an address of this host) is reached at
+// an address of this host. One elsewhere is reached on the network -- not at
+// any address it shares with this host, like a docker bridge's every host
+// has. Of several, the first on the first of our networks wins: one
+// destination, not a copy down every path.
 func (p *Participant) reachable(from netip.Addr, ls []rtps.Locator) []netip.AddrPort {
 	here := p.local[from]
-	var out []netip.AddrPort
+	best, rank := netip.AddrPort{}, -1
 	for _, l := range ls {
-		if l.Kind != rtps.LocatorUDPv4 || l.Port == 0 || l.Port >= 65536 || !l.Addr.IsValid() || l.Addr.IsUnspecified() {
+		a, ok := transport.AddrPort(l)
+		if !ok || a.Addr().IsUnspecified() || a.Addr().IsMulticast() {
 			continue
 		}
-		ok := p.local[l.Addr]
-		if !here {
-			ok = p.cfg.Scope == ScopeNetwork && !p.local[l.Addr] && p.onNetwork(l.Addr)
+		if here {
+			ok = p.local[a.Addr()]
+		} else {
+			ok = p.cfg.Scope == ScopeNetwork && !p.local[a.Addr()] && p.onNetwork(a.Addr())
 		}
-		if ok {
-			out = append(out, netip.AddrPortFrom(l.Addr, uint16(l.Port)))
+		if !ok {
+			continue
+		}
+		if r := p.rank(a.Addr()); rank < 0 || r < rank {
+			best, rank = a, r
 		}
 	}
-	return out
+	if rank < 0 {
+		return nil
+	}
+	return []netip.AddrPort{best}
+}
+
+// rank orders addresses by our networks: the index of the first that has
+// it, the loopback and the rest last.
+func (p *Participant) rank(a netip.Addr) int {
+	for i, n := range p.nets {
+		if n.Contains(a) && !a.IsLoopback() {
+			return i
+		}
+	}
+	return len(p.nets)
 }
 
 // spdpTargets are where SPDP goes besides the participants already known:
@@ -192,87 +149,27 @@ func (p *Participant) spdpTargets() []netip.AddrPort {
 	return out
 }
 
-// setMulticast makes the unicast socket send multicast out of the DDS
-// interface, to this link only, and to this host too.
-func (p *Participant) setMulticast() error {
-	pc := ipv4.NewPacketConn(p.conn)
-	if err := pc.SetMulticastInterface(p.cfg.Interface); err != nil {
-		return err
-	}
-	if err := pc.SetMulticastTTL(1); err != nil {
-		return err
-	}
-	return pc.SetMulticastLoopback(true)
-}
-
-// pacer sends at most rate bytes a second, in bursts of up to burst, from a
-// queue: what does not fit in the queue is dropped (and counted), for the
-// reliable protocol to send again.
-type pacer struct {
-	rate, burst float64
-	queue       chan paced
-	now         func() time.Time
-	sleep       func(time.Duration)
-	write       func(netip.AddrPort, []byte)
-
-	mu      sync.Mutex
-	dropped int64
-}
-
-type paced struct {
-	to  netip.AddrPort
-	msg []byte
-}
-
-func newPacer(rate, burst int, write func(netip.AddrPort, []byte)) *pacer {
-	return &pacer{
-		rate: float64(rate), burst: float64(max(burst, 1)),
-		queue: make(chan paced, 4096),
-		now:   time.Now, sleep: time.Sleep, write: write,
-	}
-}
-
-func (q *pacer) enqueue(to netip.AddrPort, msg []byte) {
-	select {
-	case q.queue <- paced{to, msg}:
-	default:
-		q.mu.Lock()
-		q.dropped++
-		q.mu.Unlock()
-	}
-}
-
-// run sends the queue until the context ends.
-func (q *pacer) run(ctx context.Context) {
-	tokens, last := q.burst, q.now()
-	for {
-		var m paced
-		select {
-		case <-ctx.Done():
-			return
-		case m = <-q.queue:
+// ParticipantIndex is the index whose port the participant took, or -1.
+func (p *Participant) ParticipantIndex() int {
+	for _, t := range p.transports {
+		if pt, ok := t.(*transport.Paced); ok {
+			t = pt.Transport
 		}
-		need := float64(len(m.msg))
-		for {
-			now := q.now()
-			tokens = min(q.burst, tokens+now.Sub(last).Seconds()*q.rate)
-			last = now
-			if tokens >= need || tokens >= q.burst {
-				break
-			}
-			q.sleep(time.Duration((min(need, q.burst) - tokens) / q.rate * float64(time.Second)))
+		if it, ok := t.(interface{ Index() int }); ok {
+			return it.Index()
 		}
-		tokens -= need
-		q.write(m.to, m.msg)
 	}
+	return -1
 }
 
-// Dropped is how many datagrams the send queue had no room for.
+// Dropped is how many messages the send queues (MaxSendRate) had no room
+// for.
 func (p *Participant) Dropped() int64 {
-	if p.pacer == nil {
-		return 0
+	var n int64
+	for _, t := range p.transports {
+		if pt, ok := t.(*transport.Paced); ok {
+			n += pt.Dropped()
+		}
 	}
-	p.pacer.mu.Lock()
-	defer p.pacer.mu.Unlock()
-	return p.pacer.dropped
+	return n
 }
