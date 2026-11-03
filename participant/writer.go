@@ -14,15 +14,8 @@ import (
 // oldest.
 var ErrHistoryFull = errors.New("participant: the writer's history is full of unacknowledged samples")
 
-// Sizes of what a writer sends. A sample larger than maxDataPayload goes in
-// DATA_FRAGs of fragSize octets, fragsPerMessage to a datagram: a datagram
-// stays under 64 KiB.
-const (
-	maxDataPayload  = 60000
-	fragSize        = 16000
-	fragsPerMessage = 3
-	heartbeatPeriod = 200 * time.Millisecond
-)
+// heartbeatPeriod is how often a reader that lacks something is reminded.
+const heartbeatPeriod = 200 * time.Millisecond
 
 // outbound is a message to send, to every address.
 type outbound struct {
@@ -70,6 +63,17 @@ type writerConfig struct {
 	// keyed keeps one change per key: the built-in SEDP writers, whose
 	// instances are endpoints.
 	keyed bool
+	// maxMessage bounds a datagram. A sample that does not fit in one goes
+	// in DATA_FRAGs of fragSize octets, as many to a datagram as fit.
+	maxMessage, fragSize int
+}
+
+// maxData is the largest sample sent whole.
+func (c writerConfig) maxData() int { return c.maxMessage - messageOverhead }
+
+// fragsPerMessage is how many fragments go in a datagram.
+func (c writerConfig) fragsPerMessage() uint32 {
+	return uint32(max(1, (c.maxMessage-messageOverhead)/c.fragSize))
 }
 
 // stateWriter is the writer side of delivery to the readers matched with it
@@ -90,6 +94,9 @@ func newStateWriter(prefix rtps.GUIDPrefix, cfg writerConfig) *stateWriter {
 	}
 	if cfg.maxSamples <= 0 {
 		cfg.maxSamples = 1000
+	}
+	if cfg.maxMessage <= 0 || cfg.fragSize <= 0 {
+		cfg.maxMessage, cfg.fragSize = hostMaxMessage, hostFragment
 	}
 	return &stateWriter{cfg: cfg, prefix: prefix, readers: map[rtps.GUID]*readerProxy{}}
 }
@@ -163,35 +170,36 @@ func (w *stateWriter) available(r *readerProxy) (first, last rtps.SequenceNumber
 // dataMessages are the datagrams carrying a change to one reader: one DATA,
 // or DATA_FRAGs.
 func (w *stateWriter) dataMessages(r *readerProxy, c *change) [][]byte {
-	if len(c.payload) <= maxDataPayload {
+	if len(c.payload) <= w.cfg.maxData() {
 		b := w.builder(r.guid.Prefix).InfoTS(c.at)
 		b.Data(r.guid.Entity, w.cfg.id, c.sn, c.inlineQoS, c.payload, c.keyOnly)
 		return [][]byte{b.Bytes()}
 	}
 	n := w.fragments(c)
 	var out [][]byte
-	for start := uint32(1); start <= n; start += fragsPerMessage {
-		out = append(out, w.fragMessage(r, c, start, min(fragsPerMessage, n-start+1)))
+	per := w.cfg.fragsPerMessage()
+	for start := uint32(1); start <= n; start += per {
+		out = append(out, w.fragMessage(r, c, start, min(per, n-start+1)))
 	}
 	return out
 }
 
 // fragments is how many fragments a change is cut in.
 func (w *stateWriter) fragments(c *change) uint32 {
-	return uint32((len(c.payload) + fragSize - 1) / fragSize)
+	return uint32((len(c.payload) + w.cfg.fragSize - 1) / w.cfg.fragSize)
 }
 
 // fragMessage is a datagram with fragments start .. start+count-1 of a
 // change.
 func (w *stateWriter) fragMessage(r *readerProxy, c *change, start, count uint32) []byte {
-	from := int(start-1) * fragSize
-	to := min(len(c.payload), from+int(count)*fragSize)
+	from := int(start-1) * w.cfg.fragSize
+	to := min(len(c.payload), from+int(count)*w.cfg.fragSize)
 	b := w.builder(r.guid.Prefix).InfoTS(c.at)
 	var qos []byte
 	if start == 1 {
 		qos = c.inlineQoS
 	}
-	b.DataFrag(r.guid.Entity, w.cfg.id, c.sn, start, uint16(count), fragSize, uint32(len(c.payload)), qos, c.payload[from:to])
+	b.DataFrag(r.guid.Entity, w.cfg.id, c.sn, start, uint16(count), uint16(w.cfg.fragSize), uint32(len(c.payload)), qos, c.payload[from:to])
 	return b.Bytes()
 }
 
@@ -340,7 +348,7 @@ func (w *stateWriter) onNackFrag(reader rtps.GUID, nf rtps.NackFrag) []outbound 
 	}
 	r.nfCount = nf.Count
 	c := w.find(nf.SN)
-	if c == nil || len(c.payload) <= maxDataPayload {
+	if c == nil || len(c.payload) <= w.cfg.maxData() {
 		return nil
 	}
 	n := w.fragments(c)

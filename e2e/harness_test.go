@@ -431,6 +431,13 @@ func (h *Host) Degrade(t testing.TB, netem string) {
 	docker(t, append([]string{"exec", h.name, "tc", "qdisc", "add", "dev", "lo", "root", "netem"}, strings.Fields(netem)...)...)
 }
 
+// DegradeNetwork makes the host's network interface lose, delay or
+// reorder what it sends (tc netem arguments).
+func (h *Host) DegradeNetwork(t testing.TB, netem string) {
+	t.Helper()
+	docker(t, append([]string{"exec", h.name, "tc", "qdisc", "add", "dev", "eth0", "root", "netem"}, strings.Fields(netem)...)...)
+}
+
 // RSS is a process's resident memory on the host, in KiB, by command name.
 func (h *Host) RSS(t testing.TB, comm string) (rss, peak int) {
 	t.Helper()

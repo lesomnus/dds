@@ -173,14 +173,14 @@ func (p *Participant) unmatch(ep *discovery.Endpoint) {
 	}
 }
 
-// userAddrs is where traffic for a user writer goes: its unicast locators
-// on this host, else its participant's default ones, else its metatraffic
+// userAddrs is where traffic for a user endpoint goes: its unicast locators
+// we may reach, else its participant's default ones, else its metatraffic
 // ones. Called with mu held.
 func (p *Participant) userAddrs(pe *peer, ep *discovery.Endpoint) []netip.AddrPort {
-	if a := p.localLocators(ep.Unicast); len(a) > 0 {
+	if a := p.reachable(pe.data.From.Addr(), ep.Unicast); len(a) > 0 {
 		return a
 	}
-	if a := p.localLocators(pe.data.DefaultUnicast); len(a) > 0 {
+	if a := p.reachable(pe.data.From.Addr(), pe.data.DefaultUnicast); len(a) > 0 {
 		return a
 	}
 	return pe.metatraffic
