@@ -94,6 +94,12 @@ $ ddsspy -domain 138 -iface 192.168.10.0/24 -sedp -traffic 5s
 
 One captured message costs about 130 ns.
 
+## OpenTelemetry Collector
+
+[`otelcol/ddsreceiver`](otelcol/ddsreceiver) is a collector receiver over all
+of this, in its own module: participants, endpoints and nodes as events and
+state, and each writer's traffic as metrics.
+
 ## How it stays out of the way
 
 - **It talks only to this host.** A `participant.Participant` announces
