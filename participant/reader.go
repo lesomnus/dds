@@ -35,8 +35,16 @@ type writerProxy struct {
 	frags     map[rtps.SequenceNumber]*reassembly
 	lastHB    int32
 	haveHB    bool
+	lastHBF   int32
 	ackCount  int32
+	nackCount int32
 	delivered int64
+}
+
+// fragNack is a NACK_FRAG owed: the fragments of a sample still missing.
+type fragNack struct {
+	SN      rtps.SequenceNumber
+	Missing rtps.FragmentNumberSet
 }
 
 func newWriterProxy() *writerProxy {
@@ -117,9 +125,14 @@ func (w *writerProxy) markGap(sn rtps.SequenceNumber) {
 // acknowledges everything before the first missing number and asks for
 // what is missing up to Last, at most 256 numbers at a time. A final
 // heartbeat is answered only if something is missing.
-func (w *writerProxy) heartbeat(h rtps.Heartbeat) ([]Sample, *rtps.SequenceNumberSet) {
+//
+// A sample whose fragments have partly arrived is not asked for whole:
+// its missing fragments are, in a NACK_FRAG. A writer retransmitting a
+// fragmented sample may send only its first fragment (Cyclone DDS does) and
+// wait to be told which others are missing.
+func (w *writerProxy) heartbeat(h rtps.Heartbeat) ([]Sample, *rtps.SequenceNumberSet, []fragNack) {
 	if w.haveHB && h.Count <= w.lastHB {
-		return nil, nil
+		return nil, nil, nil
 	}
 	w.haveHB, w.lastHB = true, h.Count
 
@@ -145,15 +158,54 @@ func (w *writerProxy) heartbeat(h rtps.Heartbeat) ([]Sample, *rtps.SequenceNumbe
 	}
 
 	set := rtps.SequenceNumberSet{Base: w.next}
+	var nacks []fragNack
 	for sn := w.next; sn <= h.Last && sn-w.next < 256; sn++ {
-		if !w.has(sn) {
-			set.Add(sn)
+		if w.has(sn) {
+			continue
 		}
+		if r, ok := w.frags[sn]; ok {
+			if m := r.missingUpTo(0); m.NumBits > 0 {
+				nacks = append(nacks, fragNack{SN: sn, Missing: m})
+			}
+			continue
+		}
+		set.Add(sn)
 	}
-	if set.NumBits == 0 && h.Final {
-		return out, nil
+	if set.NumBits == 0 && h.Final && len(nacks) == 0 {
+		return out, nil, nil
 	}
-	return out, &set
+	return out, &set, nacks
+}
+
+// heartbeatFrag takes a HEARTBEAT_FRAG: the writer has fragments
+// 1..LastFragment of a sample. It returns the NACK_FRAG to answer with, if
+// any are missing.
+func (w *writerProxy) heartbeatFrag(h rtps.HeartbeatFrag) *fragNack {
+	if h.Count <= w.lastHBF && w.lastHBF != 0 {
+		return nil
+	}
+	w.lastHBF = h.Count
+	if h.SN < w.next || w.has(h.SN) || h.LastFragment == 0 {
+		return nil
+	}
+	if r, ok := w.frags[h.SN]; ok {
+		m := r.missingUpTo(h.LastFragment)
+		if m.NumBits == 0 {
+			return nil
+		}
+		return &fragNack{SN: h.SN, Missing: m}
+	}
+	// None of it yet: all of it.
+	m := rtps.FragmentNumberSet{Base: 1}
+	for n := uint32(1); n <= h.LastFragment && m.Add(n); n++ {
+	}
+	return &fragNack{SN: h.SN, Missing: m}
+}
+
+// nextNackCount numbers the NACK_FRAGs to this writer.
+func (w *writerProxy) nextNackCount() int32 {
+	w.nackCount++
+	return w.nackCount
 }
 
 // preemptive is the ACKNACK a reader sends a writer it has just matched,
@@ -213,6 +265,28 @@ type reassembly struct {
 func newReassembly(size uint32, fragSize uint16) *reassembly {
 	n := (int(size) + int(fragSize) - 1) / int(fragSize)
 	return &reassembly{buf: make([]byte, size), fragSize: int(fragSize), have: make([]bool, n), missing: n}
+}
+
+// missingUpTo is the set of fragments not yet in, from the first missing,
+// up to fragment upTo (0: all of them), 256 at most.
+func (r *reassembly) missingUpTo(upTo uint32) rtps.FragmentNumberSet {
+	last := uint32(len(r.have))
+	if upTo > 0 && upTo < last {
+		last = upTo
+	}
+	var set rtps.FragmentNumberSet
+	for i := uint32(1); i <= last; i++ {
+		if r.have[i-1] {
+			continue
+		}
+		if set.Base == 0 {
+			set.Base = i
+		}
+		if !set.Add(i) {
+			break
+		}
+	}
+	return set
 }
 
 // add copies the fragments in; it reports whether the sample is complete.

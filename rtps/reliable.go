@@ -219,3 +219,104 @@ func ParseDataFrag(s Submessage) (DataFrag, error) {
 	f.Fragments = rest
 	return f, nil
 }
+
+// FragmentNumberSet is a base and a bitmap of up to 256 fragment numbers
+// after it (RTPS 2.5, 9.4.2.8). Fragment numbers start at 1.
+type FragmentNumberSet struct {
+	Base    uint32
+	NumBits uint32
+	Bitmap  [8]uint32
+}
+
+// Add puts n in the set, if it is within Base..Base+255.
+func (s *FragmentNumberSet) Add(n uint32) bool {
+	if n < s.Base || n-s.Base >= 256 {
+		return false
+	}
+	d := n - s.Base
+	s.Bitmap[d/32] |= 1 << (31 - d%32)
+	if d+1 > s.NumBits {
+		s.NumBits = d + 1
+	}
+	return true
+}
+
+// Members lists the numbers in the set, in order.
+func (s FragmentNumberSet) Members() []uint32 {
+	var out []uint32
+	for i := uint32(0); i < s.NumBits; i++ {
+		if s.Bitmap[i/32]&(1<<(31-i%32)) != 0 {
+			out = append(out, s.Base+i)
+		}
+	}
+	return out
+}
+
+func readFragSet(o binary.ByteOrder, b []byte) (FragmentNumberSet, int, error) {
+	if len(b) < 8 {
+		return FragmentNumberSet{}, 0, ErrTruncated
+	}
+	s := FragmentNumberSet{Base: o.Uint32(b[0:4]), NumBits: o.Uint32(b[4:8])}
+	if s.NumBits > 256 {
+		return s, 0, fmt.Errorf("rtps: fragment number set of %d bits", s.NumBits)
+	}
+	words := int(s.NumBits+31) / 32
+	if len(b) < 8+4*words {
+		return s, 0, ErrTruncated
+	}
+	for i := range words {
+		s.Bitmap[i] = o.Uint32(b[8+4*i:])
+	}
+	return s, 8 + 4*words, nil
+}
+
+// HeartbeatFrag is a HEARTBEAT_FRAG submessage: the writer has fragments
+// 1..LastFragment of sample SN.
+type HeartbeatFrag struct {
+	Reader, Writer EntityID
+	SN             SequenceNumber
+	LastFragment   uint32
+	Count          int32
+}
+
+// ParseHeartbeatFrag reads a HEARTBEAT_FRAG submessage.
+func ParseHeartbeatFrag(s Submessage) (HeartbeatFrag, error) {
+	b := s.Body
+	if len(b) < 24 {
+		return HeartbeatFrag{}, ErrTruncated
+	}
+	o := s.Order()
+	return HeartbeatFrag{
+		Reader: EntityID(b[0:4]), Writer: EntityID(b[4:8]),
+		SN: readSN(o, b[8:16]), LastFragment: o.Uint32(b[16:20]), Count: int32(o.Uint32(b[20:24])),
+	}, nil
+}
+
+// NackFrag is a NACK_FRAG submessage: the reader asks again for the
+// fragments in Missing of sample SN.
+type NackFrag struct {
+	Reader, Writer EntityID
+	SN             SequenceNumber
+	Missing        FragmentNumberSet
+	Count          int32
+}
+
+// ParseNackFrag reads a NACK_FRAG submessage.
+func ParseNackFrag(s Submessage) (NackFrag, error) {
+	b := s.Body
+	if len(b) < 16 {
+		return NackFrag{}, ErrTruncated
+	}
+	o := s.Order()
+	n := NackFrag{Reader: EntityID(b[0:4]), Writer: EntityID(b[4:8]), SN: readSN(o, b[8:16])}
+	set, k, err := readFragSet(o, b[16:])
+	if err != nil {
+		return n, err
+	}
+	n.Missing = set
+	if len(b) < 16+k+4 {
+		return n, ErrTruncated
+	}
+	n.Count = int32(o.Uint32(b[16+k:]))
+	return n, nil
+}

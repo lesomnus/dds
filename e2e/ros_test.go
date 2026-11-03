@@ -151,3 +151,26 @@ func TestNodesGoWithTheirProcess(t *testing.T) {
 	p.Stop()
 	spy.WaitFor(15*time.Second, "no nodes", func(ls []SpyLine) bool { return len(Nodes(ls)) == 0 })
 }
+
+// TestAProcessWithManyNodesAlreadyRunning: the same, with the process up
+// before we are. Its ros_discovery_info sample is then history the writer
+// retransmits, and Cyclone retransmits a fragmented sample's first fragment
+// only, leaving the rest to NACK_FRAG.
+func TestAProcessWithManyNodesAlreadyRunning(t *testing.T) {
+	t.Parallel()
+	const n = 30
+	lan := NewLAN(t)
+	h := lan.NewHost(t)
+	d := randomDomain()
+	h.Python(t, d, fmt.Sprintf(`
+import rclpy, time
+rclpy.init()
+nodes = [rclpy.create_node("many_%%02d" %% i) for i in range(%d)]
+print("up", flush=True)
+time.sleep(600)
+`, n))
+	time.Sleep(5 * time.Second) // up, and its sample sent to no one
+	spy := h.Participant(t, d)
+	lines := spy.WaitFor(40*time.Second, fmt.Sprintf("%d nodes", n), func(ls []SpyLine) bool { return len(Nodes(ls)) >= n })
+	_ = lines
+}

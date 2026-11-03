@@ -112,6 +112,22 @@ func (w *Builder) AckNack(reader, writer EntityID, state SequenceNumberSet, coun
 	return w
 }
 
+// NackFrag appends a NACK_FRAG: fragments of sample sn asked for again.
+func (w *Builder) NackFrag(reader, writer EntityID, sn SequenceNumber, missing FragmentNumberSet, count int32) *Builder {
+	body := make([]byte, 0, 52)
+	body = append(body, reader[:]...)
+	body = append(body, writer[:]...)
+	body = appendSN(body, le, sn)
+	body = le.AppendUint32(body, missing.Base)
+	body = le.AppendUint32(body, missing.NumBits)
+	for i := range int(missing.NumBits+31) / 32 {
+		body = le.AppendUint32(body, missing.Bitmap[i])
+	}
+	body = le.AppendUint32(body, uint32(count))
+	w.sub(SubNackFrag, 0, body)
+	return w
+}
+
 // ParameterListWriter encodes a parameter list (PL_CDR_LE).
 type ParameterListWriter struct {
 	b []byte
