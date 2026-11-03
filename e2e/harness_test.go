@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -132,7 +133,10 @@ type Host struct {
 func (l *LAN) NewHost(t testing.TB) *Host {
 	t.Helper()
 	h := &Host{t: t, lan: l, name: randomName("host")}
-	docker(t, "run", "-d", "--name", h.name, "--network", l.name, "--entrypoint", "sleep", image(), "infinity")
+	// NET_ADMIN for tc netem, NET_RAW for tcpdump: on the namespace, which
+	// the host's processes share.
+	docker(t, "run", "-d", "--name", h.name, "--network", l.name, "--cap-add", "NET_ADMIN", "--cap-add", "NET_RAW",
+		"--entrypoint", "sleep", image(), "infinity")
 	t.Cleanup(func() { dockerQuiet("rm", "-f", h.name) })
 	docker(t, "cp", spyBin, h.name+":/ddsspy")
 	return h
@@ -395,4 +399,31 @@ func Nodes(lines []SpyLine) map[string]SpyLine {
 		names[l.Node] = l
 	}
 	return names
+}
+
+// Degrade makes the host's loopback -- the path between its processes --
+// lose, duplicate, reorder and delay packets (tc netem arguments).
+func (h *Host) Degrade(t testing.TB, netem string) {
+	t.Helper()
+	docker(t, append([]string{"exec", h.name, "tc", "qdisc", "add", "dev", "lo", "root", "netem"}, strings.Fields(netem)...)...)
+}
+
+// RSS is a process's resident memory on the host, in KiB, by command name.
+func (h *Host) RSS(t testing.TB, comm string) (rss, peak int) {
+	t.Helper()
+	out := docker(t, "exec", h.name, "sh", "-c", "grep -E '^(VmRSS|VmHWM):' /proc/$(pgrep -o -x "+comm+")/status")
+	for _, l := range strings.Split(out, "\n") {
+		f := strings.Fields(l)
+		if len(f) < 2 {
+			continue
+		}
+		n, _ := strconv.Atoi(f[1])
+		switch f[0] {
+		case "VmRSS:":
+			rss = n
+		case "VmHWM:":
+			peak = n
+		}
+	}
+	return rss, peak
 }
