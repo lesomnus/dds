@@ -34,8 +34,15 @@ type TrafficConfig struct {
 	// Enabled captures the RTPS traffic. It needs CAP_NET_RAW in the host's
 	// network namespace; without it the receiver goes on without traffic.
 	Enabled bool `mapstructure:"enabled"`
-	// CollectionInterval is how often the writers' counters are reported.
+	// CollectionInterval is how often the traffic is captured and the
+	// writers' counters reported.
 	CollectionInterval time.Duration `mapstructure:"collection_interval"`
+	// Window is how long the traffic is captured each time. Writers are
+	// counted by sequence number, so a writer seen now and then is counted
+	// whole; what is seen of sizes and retransmit requests is a sample.
+	// Outside the windows capturing costs nothing. A window as long as the
+	// interval captures all along.
+	Window time.Duration `mapstructure:"window"`
 	// Interfaces to capture on, by name. By default the DDS interface and
 	// the loopback one: participants on one host reach each other over
 	// loopback.
@@ -49,7 +56,8 @@ func createDefaultConfig() *Config {
 		ProcRoot:         "/proc",
 		Traffic: TrafficConfig{
 			Enabled:            true,
-			CollectionInterval: 10 * time.Second,
+			CollectionInterval: 5 * time.Second,
+			Window:             250 * time.Millisecond,
 		},
 	}
 }
@@ -70,6 +78,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Traffic.Enabled && c.Traffic.CollectionInterval <= 0 {
 		return errors.New("traffic.collection_interval must be positive")
+	}
+	if c.Traffic.Enabled && c.Traffic.Window <= 0 {
+		return errors.New("traffic.window must be positive")
 	}
 	return nil
 }
