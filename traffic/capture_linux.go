@@ -48,7 +48,11 @@ func Open(cfg CaptureConfig) (*Capture, error) {
 	if len(cfg.Interfaces) == 0 {
 		return nil, errors.New("traffic: no interface to capture on")
 	}
-	raw, err := bpf.Assemble(Filter(uint32(cfg.Snaplen)))
+	prog := cfg.Filter
+	if prog == nil {
+		prog = Filter(uint32(cfg.Snaplen))
+	}
+	raw, err := bpf.Assemble(prog)
 	if err != nil {
 		return nil, err
 	}
@@ -150,12 +154,12 @@ func (c *Capture) read(ctx context.Context, s *sock, fn func(Packet)) error {
 				continue // seen again as it comes in
 			}
 		}
-		msg, sp, dp, ok := rtpsPayload(buf[:min(n, len(buf))])
+		msg, src, dst, ok := rtpsPayload(buf[:min(n, len(buf))])
 		if !ok {
 			continue
 		}
 		fn(Packet{
-			Message: msg, SrcPort: sp, DstPort: dp,
+			Message: msg, Src: src, Dst: dst, SrcPort: src.Port(), DstPort: dst.Port(),
 			Interface: s.iface, Outgoing: ll.Pkttype == unix.PACKET_OUTGOING,
 			At: time.Now(),
 		})
