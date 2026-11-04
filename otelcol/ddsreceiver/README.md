@@ -5,15 +5,20 @@ that reports the DDS system on this host. It covers the participants and the
 host processes they are, their endpoints with topic, type and QoS, and how much
 each writer writes. With `ros`, it also covers the ROS 2 nodes they host.
 
-It takes part in the domain read-only and talks only to participants on this
-host, by unicast. Nothing is sent to other machines, and it is not a ROS node:
-`ros2 node list` does not show it. The traffic is read off the wire without
-taking part (see [`traffic`](../../traffic)).
+It collects the domains this host's participants are in, all of them by
+default. It takes part in a domain read-only and talks only to participants on
+this host, by unicast. Nothing is sent to other machines, and it is not a ROS
+node: `ros2 node list` does not show it. The traffic is read off the wire
+without taking part (see [`traffic`](../../traffic)).
 
 ```yaml
 receivers:
   dds:
-    domain: 138                  # ROS_DOMAIN_ID
+    domains:
+      active: [138]              # always taken part in (ROS_DOMAIN_ID); `domain: 138` is short for this
+      discover: true             # (the default) also the domains this host's participants announce themselves in
+      discovered: active         # (the default) active | passive: how a discovered domain is collected
+      ignore: []                 # never collected
     interface: 192.168.10.0/24   # the network DDS runs on, as Cyclone's <NetworkInterface address=...>
     ros: true                    # ROS nodes and names (the default)
     snapshot_interval: 1m        # the whole graph, as state, this often (the default)
@@ -32,8 +37,32 @@ receivers:
   - gomod: github.com/lesomnus/dds/otelcol/ddsreceiver v0.0.0-...
 ```
 
-Put it in a logs pipeline, a metrics pipeline, or both. One receiver ID is one
-DDS participant either way.
+Put it in a logs pipeline, a metrics pipeline, or both. One receiver ID
+collects the same domains either way.
+
+## Domains
+
+A domain is collected in one of two ways:
+
+| | how | what |
+|---|---|---|
+| **active** | It takes part as a participant that only reads and talks only to this host's participants. | participants, endpoints (topics, types, QoS), ROS nodes, traffic by topic |
+| **passive** | It listens, sending nothing. | participants, traffic by writer (no topic names: those are only learned by taking part) |
+
+The domains in `active` are always taken part in. With `discover`, a capture
+that keeps only SPDP announcements (dropping every other packet in the kernel)
+finds the domains this host's participants announce themselves in. These are
+announcements from an address of this host, to the SPDP group, at a domain's
+port. A domain only another host's participants are in is not collected:
+there would be nothing here to see. A discovered domain is left two minutes
+after its last participant here is gone.
+
+Discovering needs CAP_NET_RAW. Without it, only the `active` domains are
+collected.
+
+Every record and metric carries the domain as resource attributes:
+`dds.domain.id`, and `dds.collection.mode` (`active` or `passive`).
+`dds.capture.drops` is the receiver's own, with neither.
 
 ## What is ROS's
 

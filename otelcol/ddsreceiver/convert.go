@@ -70,10 +70,37 @@ const (
 	evNodeState = "ros.node.state"
 )
 
-func newLogs() (plog.Logs, plog.LogRecordSlice) {
+// Resource attributes.
+const (
+	attrDomain = "dds.domain.id"
+	attrMode   = "dds.collection.mode" // active, passive
+)
+
+// Collection modes.
+const (
+	modeActive  = "active"
+	modePassive = "passive"
+)
+
+// resource is what a batch of records is about: a domain, collected one
+// way; or, zero, the receiver itself (the capture).
+type resource struct {
+	domain uint32
+	mode   string
+}
+
+func (r resource) put(a pcommon.Map) {
+	a.PutStr("service.name", ServiceName)
+	if r.mode != "" {
+		a.PutInt(attrDomain, int64(r.domain))
+		a.PutStr(attrMode, r.mode)
+	}
+}
+
+func newLogs(res resource) (plog.Logs, plog.LogRecordSlice) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
-	rl.Resource().Attributes().PutStr("service.name", ServiceName)
+	res.put(rl.Resource().Attributes())
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().SetName(scopeName)
 	return ld, sl.LogRecords()
@@ -283,18 +310,18 @@ const (
 	mIncompatible = "dds.qos.incompatible_pairs"
 )
 
-func newMetrics() (pmetric.Metrics, pmetric.MetricSlice) {
+func newMetrics(res resource) (pmetric.Metrics, pmetric.MetricSlice) {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
-	rm.Resource().Attributes().PutStr("service.name", ServiceName)
+	res.put(rm.Resource().Attributes())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName(scopeName)
 	return md, sm.Metrics()
 }
 
 // snapshotMetrics is the graph's size and health.
-func snapshotMetrics(s snapshot, ros bool) pmetric.Metrics {
-	md, ms := newMetrics()
+func snapshotMetrics(res resource, s snapshot, ros bool) pmetric.Metrics {
+	md, ms := newMetrics(res)
 	ts := pcommon.NewTimestampFromTime(s.At)
 
 	gauge := func(name, desc, unit string) pmetric.NumberDataPointSlice {
