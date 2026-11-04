@@ -207,3 +207,10 @@ func (s snapshot) health(ros bool) health {
 	}
 	return h
 }
+
+// size is how many participants there are.
+func (s *state) size() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.participants)
+}

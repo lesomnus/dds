@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,13 +18,14 @@ import (
 	"github.com/lesomnus/dds/transport"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
 
 	"github.com/lesomnus/dds/otelcol/ddsreceiver/internal/procmap"
 )
 
-// ddsReceiver is one DDS participant (and capture) shared by the logs and
-// metrics pipelines a receiver of this ID is in.
+// ddsReceiver is what the logs and metrics pipelines a receiver of this ID
+// is in share: the domains it collects, and the captures.
 type ddsReceiver struct {
 	cfg    *Config
 	logger *zap.Logger
@@ -32,24 +35,55 @@ type ddsReceiver struct {
 	metrics consumer.Metrics
 	starts  int
 
-	state  *state
+	ifi    *net.Interface
+	addr   netip.Addr
+	local  map[netip.Addr]bool
+	ignore map[uint32]bool
 	procs  *procmap.Resolver
-	queue  chan any
+	queue  chan queued
+	ctx    context.Context
 	cancel context.CancelFunc
-	done   chan struct{}
+	wg     sync.WaitGroup // every goroutine but send
+	done   chan struct{}  // send's
+
+	domainsMu sync.Mutex
+	domains   map[uint32]*domain
 
 	// The traffic; nil when off, or when it could not be captured.
-	stats       *traffic.Stats
-	captureCfg  traffic.CaptureConfig
-	began       time.Time
-	drops       uint64 // by the sampling goroutine
-	trafficDone chan struct{}
+	stats      *traffic.Stats
+	captureCfg traffic.CaptureConfig
+	began      time.Time
+	drops      uint64 // by the sampling goroutine
 
 	// newParticipant is participant.New; tests replace it.
 	newParticipant func(participant.Config, func(discovery.Event)) (runner, error)
 	// openCapture is traffic.Open; tests replace it.
 	openCapture func(traffic.CaptureConfig) (capturer, error)
 	now         func() time.Time
+	// leaveAfter is how long a discovered domain is kept with no participant
+	// of this host's.
+	leaveAfter time.Duration
+}
+
+// domain is a DDS domain the receiver collects.
+type domain struct {
+	id     uint32
+	mode   string // active, passive
+	pinned bool   // configured: never left
+	state  *state
+	spdp   *discovery.SPDPObserver // passive: fed from the discovery capture
+	cancel context.CancelFunc
+	done   chan struct{}
+	// emptySince is when it last had no participant; zero while it has.
+	emptySince time.Time
+}
+
+func (d *domain) resource() resource { return resource{domain: d.id, mode: d.mode} }
+
+// queued is an event of a domain.
+type queued struct {
+	d *domain
+	e any
 }
 
 // capturer is what the receiver needs of a capture.
@@ -66,7 +100,7 @@ type runner interface {
 }
 
 // queueSize bounds the events waiting to be sent: past it, events are
-// dropped (and counted) rather than the participant's receiving held up.
+// dropped (and counted) rather than the participants' receiving held up.
 const queueSize = 4096
 
 var (
@@ -90,7 +124,8 @@ func receiverFor(id component.ID, cfg *Config, logger *zap.Logger) *ddsReceiver 
 		openCapture: func(c traffic.CaptureConfig) (capturer, error) {
 			return traffic.Open(c)
 		},
-		now: time.Now,
+		now:        time.Now,
+		leaveAfter: 2 * time.Minute,
 	}
 	shared[id] = r
 	return r
@@ -126,8 +161,11 @@ func (r *ddsReceiver) start() error {
 	if err != nil {
 		return err
 	}
-	ifi, addr, err := transport.InterfaceByAddr(prefix)
+	r.ifi, r.addr, err = transport.InterfaceByAddr(prefix)
 	if err != nil {
+		return err
+	}
+	if r.local, err = transport.LocalAddrs(); err != nil {
 		return err
 	}
 	if procs, err := procmap.New(r.cfg.ProcRoot); err == nil {
@@ -135,31 +173,100 @@ func (r *ddsReceiver) start() error {
 	} else {
 		r.logger.Warn("participants will not be tied to host processes", zap.Error(err))
 	}
-
-	r.state = newState()
-	r.queue = make(chan any, queueSize)
-	r.done = make(chan struct{})
-
-	var graph *ros2.Graph
-	if r.cfg.ROS {
-		graph = ros2.NewGraph(r.enqueue)
+	r.ignore = map[uint32]bool{}
+	for _, d := range r.cfg.Domains.Ignore {
+		r.ignore[d] = true
 	}
-	p, err := r.newParticipant(participant.Config{
-		Domain:    r.cfg.Domain,
-		Interface: ifi,
-		Addr:      addr,
-		Name:      "otelcol-dds",
-	}, func(e discovery.Event) {
-		r.enqueue(e)
-		if graph != nil {
-			graph.HandleDiscovery(e)
+	r.queue = make(chan queued, queueSize)
+	r.done = make(chan struct{})
+	r.domains = map[uint32]*domain{}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+
+	if r.cfg.Traffic.Enabled {
+		r.openTraffic()
+	}
+	for _, id := range r.cfg.active() {
+		if _, err := r.join(id, modeActive, true); err != nil {
+			r.cancel()
+			return err
 		}
+	}
+	if r.cfg.Domains.Discover {
+		r.startDiscovery()
+	}
+	if r.stats != nil {
+		r.wg.Add(1)
+		go r.sampleTraffic(r.ctx)
+	}
+	r.wg.Add(1)
+	go r.maintain(r.ctx)
+	go r.send(r.ctx)
+	r.logger.Info("observing DDS",
+		zap.Uint32s("domains", r.cfg.active()), zap.Bool("discover", r.cfg.Domains.Discover),
+		zap.String("interface", r.ifi.Name), zap.Stringer("addr", r.addr))
+	return nil
+}
+
+// captureInterfaces are what the captures listen on: the configured ones,
+// else the DDS interface and the loopback ones.
+func (r *ddsReceiver) captureInterfaces() []string {
+	if names := r.cfg.Traffic.Interfaces; len(names) > 0 {
+		return names
+	}
+	names := []string{r.ifi.Name}
+	if ifs, err := net.Interfaces(); err == nil {
+		for _, i := range ifs {
+			if i.Flags&net.FlagLoopback != 0 && i.Flags&net.FlagUp != 0 && i.Name != r.ifi.Name {
+				names = append(names, i.Name)
+			}
+		}
+	}
+	return names
+}
+
+// join starts collecting a domain, actively (a participant) or passively
+// (an SPDP observer fed by the discovery capture). Called with r.mu held,
+// or from the discovery capture.
+func (r *ddsReceiver) join(id uint32, mode string, pinned bool) (*domain, error) {
+	r.domainsMu.Lock()
+	defer r.domainsMu.Unlock()
+	if d, ok := r.domains[id]; ok {
+		return d, nil
+	}
+	d := &domain{id: id, mode: mode, pinned: pinned, state: newState(), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(r.ctx)
+	d.cancel = cancel
+	events := func(e discovery.Event) {
+		r.enqueue(queued{d, e})
 		if l, ok := e.(discovery.ParticipantLost); ok && r.stats != nil {
 			r.stats.ForgetParticipant(l.Participant.GUID.Prefix)
 		}
+	}
+	if mode == modePassive {
+		d.spdp = discovery.NewSPDPObserver(discovery.SPDPConfig{Domain: id, Filter: discovery.LocalOnly(r.local), Now: r.now}, events)
+		close(d.done) // nothing runs: the discovery capture feeds it
+		r.domains[id] = d
+		r.logger.Info("collecting a domain", zap.Uint32("domain", id), zap.String("mode", mode))
+		return d, nil
+	}
+	var graph *ros2.Graph
+	if r.cfg.ROS {
+		graph = ros2.NewGraph(func(e any) { r.enqueue(queued{d, e}) })
+	}
+	p, err := r.newParticipant(participant.Config{
+		Domain:    id,
+		Interface: r.ifi,
+		Addr:      r.addr,
+		Name:      "otelcol-dds",
+	}, func(e discovery.Event) {
+		events(e)
+		if graph != nil {
+			graph.HandleDiscovery(e)
+		}
 	})
 	if err != nil {
-		return err
+		cancel()
+		return nil, err
 	}
 	if graph != nil {
 		// What ros2.Graph.Subscribe asks for, on the runner.
@@ -175,47 +282,143 @@ func (r *ddsReceiver) start() error {
 			Handle: func(w rtps.GUID, s participant.Sample) { graph.HandleSample(w, s.Payload) },
 		})
 		if err != nil {
-			return err
+			cancel()
+			return nil, err
 		}
 	}
-
-	if r.cfg.Traffic.Enabled {
-		r.openTraffic(ifi)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	r.cancel = cancel
-	if r.stats != nil {
-		r.trafficDone = make(chan struct{})
-		go r.sampleTraffic(ctx)
-	}
-	go r.send(ctx)
+	r.domains[id] = d
 	go func() {
+		defer close(d.done)
 		if err := p.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			r.logger.Error("DDS participant stopped", zap.Error(err))
+			r.logger.Error("DDS participant stopped", zap.Uint32("domain", id), zap.Error(err))
 		}
 	}()
-	r.logger.Info("observing DDS", zap.Uint32("domain", r.cfg.Domain), zap.String("interface", ifi.Name), zap.Stringer("addr", addr))
-	return nil
+	r.logger.Info("collecting a domain", zap.Uint32("domain", id), zap.String("mode", mode))
+	return d, nil
 }
 
-// openTraffic opens the capture of the traffic, on the DDS interface and the
-// loopback ones unless told which. Failing (no CAP_NET_RAW, say), the
-// receiver goes on without.
-func (r *ddsReceiver) openTraffic(ifi *net.Interface) {
-	names := r.cfg.Traffic.Interfaces
-	if len(names) == 0 {
-		names = []string{ifi.Name}
-		ifs, err := net.Interfaces()
-		if err == nil {
-			for _, i := range ifs {
-				if i.Flags&net.FlagLoopback != 0 && i.Flags&net.FlagUp != 0 && i.Name != ifi.Name {
-					names = append(names, i.Name)
-				}
+// leave stops collecting a domain.
+func (r *ddsReceiver) leave(d *domain) {
+	r.domainsMu.Lock()
+	delete(r.domains, d.id)
+	r.domainsMu.Unlock()
+	d.cancel()
+	<-d.done
+	r.logger.Info("left a domain: no participant of this host's in it", zap.Uint32("domain", d.id))
+}
+
+// domainList is the domains collected, by ID.
+func (r *ddsReceiver) domainList() []*domain {
+	r.domainsMu.Lock()
+	defer r.domainsMu.Unlock()
+	out := make([]*domain, 0, len(r.domains))
+	for _, d := range r.domains {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
+	return out
+}
+
+func (r *ddsReceiver) domain(id uint32) *domain {
+	r.domainsMu.Lock()
+	defer r.domainsMu.Unlock()
+	return r.domains[id]
+}
+
+// startDiscovery opens the discovery capture: SPDP announcements alone, all
+// along. Every other packet is dropped in the kernel. Failing (no
+// CAP_NET_RAW), only the configured domains are collected.
+func (r *ddsReceiver) startDiscovery() {
+	cfg := traffic.CaptureConfig{
+		Interfaces: r.captureInterfaces(),
+		Snaplen:    traffic.SPDPSnaplen,
+		Filter:     traffic.SPDPFilter(traffic.SPDPSnaplen),
+	}
+	c, err := r.openCapture(cfg)
+	if err != nil {
+		r.logger.Warn("domains will not be discovered: the traffic cannot be captured", zap.Error(err))
+		return
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer c.Close()
+		if err := c.Run(r.ctx, r.discovered); err != nil && !errors.Is(err, context.Canceled) {
+			r.logger.Error("discovery capture stopped", zap.Error(err))
+		}
+	}()
+	r.logger.Info("discovering domains", zap.Strings("interfaces", cfg.Interfaces), zap.String("discovered", r.cfg.Domains.Discovered))
+}
+
+// discovered takes an SPDP announcement the discovery capture saw: one of
+// this host's participants in a domain not collected yet is a domain to
+// join; in a passive domain it is what the domain's observer reads.
+func (r *ddsReceiver) discovered(p traffic.Packet) {
+	id, ok := traffic.SPDPDomain(p.Dst.Port())
+	if !ok || r.ignore[id] || !r.local[p.Src.Addr()] {
+		return
+	}
+	d := r.domain(id)
+	if d == nil {
+		if r.ctx.Err() != nil {
+			return
+		}
+		var err error
+		if d, err = r.join(id, r.cfg.Domains.Discovered, false); err != nil {
+			r.logger.Warn("domain not joined", zap.Uint32("domain", id), zap.Error(err))
+			return
+		}
+	}
+	if d.spdp != nil {
+		d.spdp.Handle(p.Src, p.Message)
+	}
+}
+
+// maintain expires passive domains' participants, and leaves the
+// discovered domains that have had no participant of this host's for a
+// while.
+func (r *ddsReceiver) maintain(ctx context.Context) {
+	defer r.wg.Done()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := r.now()
+		for _, d := range r.domainList() {
+			if d.spdp != nil {
+				d.spdp.CheckLeases()
+			}
+			if d.pinned {
+				continue
+			}
+			if d.state.size() > 0 || len(d.spdpParticipants()) > 0 {
+				d.emptySince = time.Time{}
+				continue
+			}
+			if d.emptySince.IsZero() {
+				d.emptySince = now
+			} else if now.Sub(d.emptySince) >= r.leaveAfter {
+				r.leave(d)
 			}
 		}
 	}
-	cfg := traffic.CaptureConfig{Interfaces: names, Buffer: captureBuffer}
+}
+
+func (d *domain) spdpParticipants() []discovery.Participant {
+	if d.spdp == nil {
+		return nil
+	}
+	return d.spdp.Participants()
+}
+
+// openTraffic finds out whether the traffic can be captured. Failing (no
+// CAP_NET_RAW, say), the receiver goes on without.
+func (r *ddsReceiver) openTraffic() {
+	cfg := traffic.CaptureConfig{Interfaces: r.captureInterfaces(), Buffer: captureBuffer}
 	// Opened once now to know it can be; then for each window.
 	c, err := r.openCapture(cfg)
 	if err != nil {
@@ -225,7 +428,7 @@ func (r *ddsReceiver) openTraffic(ifi *net.Interface) {
 	_ = c.Close()
 	r.captureCfg, r.stats, r.began = cfg, traffic.NewStats(), r.now()
 	r.logger.Info("capturing the RTPS traffic",
-		zap.Strings("interfaces", names),
+		zap.Strings("interfaces", cfg.Interfaces),
 		zap.Duration("window", r.cfg.Traffic.Window),
 		zap.Duration("every", r.cfg.Traffic.CollectionInterval))
 }
@@ -241,7 +444,7 @@ const captureBuffer = 32 << 20
 // numbers, seeing a writer now and then is enough to know how much it
 // wrote. A window as long as the interval captures all along.
 func (r *ddsReceiver) sampleTraffic(ctx context.Context) {
-	defer close(r.trafficDone)
+	defer r.wg.Done()
 	every, window := r.cfg.Traffic.CollectionInterval, r.cfg.Traffic.Window
 	observe := func(p traffic.Packet) { r.stats.Observe(p.Message, p.At) }
 	t := time.NewTicker(every)
@@ -298,38 +501,46 @@ func (r *ddsReceiver) shutdown(ctx context.Context) (bool, error) {
 	r.mu.Lock()
 	r.starts--
 	last := r.starts <= 0
-	cancel, done, trafficDone := r.cancel, r.done, r.trafficDone
+	cancel, done := r.cancel, r.done
 	r.mu.Unlock()
 	if !last || cancel == nil {
 		return last, nil
 	}
 	cancel()
-	if trafficDone != nil {
-		select {
-		case <-trafficDone:
-		case <-ctx.Done():
-			return true, ctx.Err()
+	stopped := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		for _, d := range r.domainList() {
+			<-d.done
 		}
-	}
+		<-done
+		close(stopped)
+	}()
 	select {
-	case <-done:
+	case <-stopped:
 	case <-ctx.Done():
 		return true, ctx.Err()
 	}
 	return true, nil
 }
 
-func (r *ddsReceiver) enqueue(e any) {
+func (r *ddsReceiver) enqueue(q queued) {
 	select {
-	case r.queue <- e:
+	case r.queue <- q:
 	default:
 		r.logger.Warn("event dropped: the queue is full")
 	}
 }
 
+// batch is the log records of one domain waiting to be sent.
+type batch struct {
+	ld plog.Logs
+	rs plog.LogRecordSlice
+}
+
 // send drains the queue into the pipelines: events as log records, batched
-// up to a second; the whole graph every snapshot interval, as state records
-// and metrics.
+// up to a second; each domain's graph every snapshot interval, as state
+// records and metrics.
 func (r *ddsReceiver) send(ctx context.Context) {
 	defer close(r.done)
 	flush := time.NewTicker(time.Second)
@@ -337,55 +548,70 @@ func (r *ddsReceiver) send(ctx context.Context) {
 	defer flush.Stop()
 	defer snap.Stop()
 
-	ld, rs := newLogs()
+	batches := map[*domain]*batch{}
+	of := func(d *domain) *batch {
+		b, ok := batches[d]
+		if !ok {
+			b = &batch{}
+			b.ld, b.rs = newLogs(d.resource())
+			batches[d] = b
+		}
+		return b
+	}
 	push := func() {
-		if rs.Len() == 0 {
-			return
-		}
-		if logs := r.logsConsumer(); logs != nil {
-			if err := logs.ConsumeLogs(ctx, ld); err != nil {
-				r.logger.Debug("logs not consumed", zap.Error(err))
+		logs := r.logsConsumer()
+		for d, b := range batches {
+			if b.rs.Len() > 0 && logs != nil {
+				if err := logs.ConsumeLogs(ctx, b.ld); err != nil {
+					r.logger.Debug("logs not consumed", zap.Error(err))
+				}
 			}
+			delete(batches, d)
 		}
-		ld, rs = newLogs()
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			push()
 			return
-		case e := <-r.queue:
-			p, _ := r.state.apply(e, r.resolve)
-			appendEvent(rs, e, p, r.now(), r.cfg.ROS)
-			if rs.Len() >= 512 {
+		case q := <-r.queue:
+			p, _ := q.d.state.apply(q.e, r.resolve)
+			b := of(q.d)
+			appendEvent(b.rs, q.e, p, r.now(), r.cfg.ROS)
+			if b.rs.Len() >= 512 {
 				push()
 			}
 		case <-flush.C:
 			push()
 		case <-snap.C:
-			s := r.state.snapshot(r.now())
-			if r.cfg.ROS {
-				appendSnapshot(rs, s)
-			}
-			push()
-			if m := r.metricsConsumer(); m != nil {
-				if err := m.ConsumeMetrics(ctx, snapshotMetrics(s, r.cfg.ROS)); err != nil {
-					r.logger.Debug("metrics not consumed", zap.Error(err))
+			now := r.now()
+			m := r.metricsConsumer()
+			for _, d := range r.domainList() {
+				s := d.state.snapshot(now)
+				if r.cfg.ROS && d.mode == modeActive {
+					appendSnapshot(of(d).rs, s)
+				}
+				if m != nil {
+					if err := m.ConsumeMetrics(ctx, snapshotMetrics(d.resource(), s, r.cfg.ROS && d.mode == modeActive)); err != nil {
+						r.logger.Debug("metrics not consumed", zap.Error(err))
+					}
 				}
 			}
+			push()
 		}
 	}
 }
 
-// sendTraffic reports the local writers' traffic, and forgets writers of
-// other hosts' participants that have gone quiet: their goodbyes are not
-// heard here.
+// sendTraffic reports each domain's local writers' traffic, and forgets
+// writers of other hosts' participants that have gone quiet: their goodbyes
+// are not heard here.
 func (r *ddsReceiver) sendTraffic(ctx context.Context) {
 	now := r.now()
 	quiet := now.Add(-2 * time.Minute)
 	ws := r.stats.Writers()
+	domains := r.domainList()
 	for _, w := range ws {
-		if w.LastSeen.Before(quiet) && !r.state.isLocal(w.GUID.Prefix) {
+		if w.LastSeen.Before(quiet) && !slices.ContainsFunc(domains, func(d *domain) bool { return d.state.isLocal(w.GUID.Prefix) }) {
 			r.stats.Forget(w.GUID)
 		}
 	}
@@ -393,7 +619,16 @@ func (r *ddsReceiver) sendTraffic(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	if err := m.ConsumeMetrics(ctx, trafficMetrics(now, r.began, r.state.localWriters(ws), r.drops, r.cfg.ROS)); err != nil {
+	for _, d := range domains {
+		lw := d.state.localWriters(ws)
+		if len(lw) == 0 {
+			continue
+		}
+		if err := m.ConsumeMetrics(ctx, trafficMetrics(d.resource(), now, lw, r.cfg.ROS && d.mode == modeActive)); err != nil {
+			r.logger.Debug("metrics not consumed", zap.Error(err))
+		}
+	}
+	if err := m.ConsumeMetrics(ctx, dropsMetrics(now, r.began, r.drops)); err != nil {
 		r.logger.Debug("metrics not consumed", zap.Error(err))
 	}
 }

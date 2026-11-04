@@ -3,6 +3,7 @@ package ddsreceiver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"testing"
@@ -54,7 +55,7 @@ func attrs(t *testing.T, rs plog.LogRecordSlice, i int) map[string]any {
 }
 
 func TestEventsBecomeRecords(t *testing.T) {
-	_, rs := newLogs()
+	_, rs := newLogs(resource{domain: 138, mode: modeActive})
 	p := participantState{Participant: talker, Process: proc}
 	now := time.Unix(1_800_000_100, 0)
 	for _, e := range []any{
@@ -119,7 +120,7 @@ func TestSnapshotHealth(t *testing.T) {
 	if h.IncompatiblePairs != 1 || h.ReadersWithoutWriters != 1 || h.WritersWithoutReaders != 0 {
 		t.Errorf("%+v: want 1 incompatible pair, 1 reader without a writer; services not counted", h)
 	}
-	md := snapshotMetrics(s, true)
+	md := snapshotMetrics(resource{}, s, true)
 	if md.MetricCount() != 5 {
 		t.Errorf("%d metrics", md.MetricCount())
 	}
@@ -127,7 +128,7 @@ func TestSnapshotHealth(t *testing.T) {
 	if h := s.health(false); h.WritersWithoutReaders != 1 {
 		t.Errorf("%+v: want the service's writer unmatched", h)
 	}
-	if md := snapshotMetrics(s, false); md.MetricCount() != 4 {
+	if md := snapshotMetrics(resource{}, s, false); md.MetricCount() != 4 {
 		t.Errorf("without ROS, %d metrics: want no ros.nodes", md.MetricCount())
 	}
 }
@@ -142,7 +143,7 @@ func TestStateFollowsEvents(t *testing.T) {
 	if len(snap.Participants) != 1 || len(snap.Endpoints) != 1 || len(snap.Nodes) != 1 || snap.Participants[0].Process.PID != 4242 {
 		t.Fatalf("%+v", snap)
 	}
-	_, rs := newLogs()
+	_, rs := newLogs(resource{domain: 138, mode: modeActive})
 	appendSnapshot(rs, snap)
 	if rs.Len() != 1 || attrs(t, rs, 0)[attrEvent] != evNodeState || attrs(t, rs, 0)[attrProcessPID] != int64(4242) {
 		t.Errorf("state record %v", attrs(t, rs, 0))
@@ -204,7 +205,7 @@ func TestTrafficMetrics(t *testing.T) {
 	if len(ws) != 1 {
 		t.Fatalf("%d writers, want the local one", len(ws))
 	}
-	md := trafficMetrics(at, at, ws, 3, true)
+	md := trafficMetrics(resource{domain: 138, mode: modeActive}, at, ws, true)
 	got := map[string]pmetric.NumberDataPoint{}
 	rm := md.ResourceMetrics().At(0)
 	ms := rm.ScopeMetrics().At(0).Metrics()
@@ -222,7 +223,7 @@ func TestTrafficMetrics(t *testing.T) {
 			got[key] = dp
 		}
 	}
-	for name, want := range map[string]int64{mWriterSamples: 10, mWriterBytes: 240, mWriterRetransmit + "/sample": 0, mWriterRetransmit + "/fragment": 0, mCaptureDrops: 3} {
+	for name, want := range map[string]int64{mWriterSamples: 10, mWriterBytes: 240, mWriterRetransmit + "/sample": 0, mWriterRetransmit + "/fragment": 0} {
 		if dp, ok := got[name]; !ok || dp.IntValue() != want {
 			t.Errorf("%s = %v, want %d", name, dp.IntValue(), want)
 		}
@@ -236,11 +237,19 @@ func TestTrafficMetrics(t *testing.T) {
 			t.Errorf("%s = %v, want %v", k, a[k], want)
 		}
 	}
-	if v, _ := rm.Resource().Attributes().Get("service.name"); v.Str() != "dds" {
-		t.Errorf("service.name %q", v.Str())
+	ra := rm.Resource().Attributes().AsRaw()
+	if ra["service.name"] != "dds" || ra[attrDomain] != int64(138) || ra[attrMode] != modeActive {
+		t.Errorf("resource %v", ra)
+	}
+	drops := dropsMetrics(at, at, 3).ResourceMetrics().At(0)
+	if v := drops.ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0).IntValue(); v != 3 {
+		t.Errorf("drops %d", v)
+	}
+	if _, ok := drops.Resource().Attributes().Get(attrDomain); ok {
+		t.Error("the capture's drops are of a domain")
 	}
 	// Without ROS, no ROS names.
-	a = trafficMetrics(at, at, ws, 0, false).ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0).Attributes().AsRaw()
+	a = trafficMetrics(resource{domain: 138, mode: modeActive}, at, ws, false).ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0).Attributes().AsRaw()
 	if _, ok := a[attrROSName]; ok {
 		t.Errorf("ROS names without ROS: %v", a)
 	}
@@ -281,6 +290,7 @@ func TestTheReceiverIsSharedAndReports(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
 	cfg.Interface = "127.0.0.0/8"
+	cfg.Domain = u32(138)
 	cfg.SnapshotInterval = 200 * time.Millisecond
 	cfg.ProcRoot = t.TempDir() // no /proc: no processes, and that is fine
 	cfg.Traffic.CollectionInterval = 200 * time.Millisecond
@@ -389,6 +399,7 @@ func TestTrafficInWindows(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
 	cfg.Interface = "127.0.0.0/8"
+	cfg.Domain = u32(138)
 	cfg.ProcRoot = t.TempDir()
 	cfg.Traffic.CollectionInterval = 100 * time.Millisecond
 	cfg.Traffic.Window = 20 * time.Millisecond
@@ -470,6 +481,7 @@ func TestNoCaptureNoTraffic(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
 	cfg.Interface = "127.0.0.0/8"
+	cfg.Domain = u32(138)
 	cfg.ProcRoot = t.TempDir()
 	set := receivertest.NewNopSettings(f.Type())
 	set.ID = component.NewIDWithName(f.Type(), t.Name())
@@ -493,21 +505,41 @@ func TestNoCaptureNoTraffic(t *testing.T) {
 	}
 }
 
+func u32(v uint32) *uint32 { return &v }
+
 func TestConfigValidate(t *testing.T) {
+	ok := func() *Config {
+		c := createDefaultConfig()
+		c.Interface = "192.168.10.0/24"
+		return c
+	}
+	if err := ok().Validate(); err != nil {
+		t.Errorf("the default (all domains): %v", err)
+	}
 	c := createDefaultConfig()
 	if c.Validate() == nil {
 		t.Error("no interface: no error")
 	}
-	c.Interface = "192.168.10.0/24"
-	if err := c.Validate(); err != nil {
-		t.Error(err)
+	for name, f := range map[string]func(*Config){
+		"domain 233":             func(c *Config) { c.Domain = u32(233) },
+		"active 233":             func(c *Config) { c.Domains.Active = []uint32{233} },
+		"a bare address":         func(c *Config) { c.Interface = "192.168.10.0" },
+		"active and ignored":     func(c *Config) { c.Domains.Active, c.Domains.Ignore = []uint32{138}, []uint32{138} },
+		"domain and ignored":     func(c *Config) { c.Domain, c.Domains.Ignore = u32(7), []uint32{7} },
+		"nothing to collect":     func(c *Config) { c.Domains.Discover = false },
+		"discovered how":         func(c *Config) { c.Domains.Discovered = "loudly" },
+		"window zero":            func(c *Config) { c.Traffic.Window = 0 },
+		"snapshot interval zero": func(c *Config) { c.SnapshotInterval = 0 },
+	} {
+		c := ok()
+		f(c)
+		if c.Validate() == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
-	c.Domain = 233
-	if c.Validate() == nil {
-		t.Error("domain 233: no error")
-	}
-	c.Domain, c.Interface = 138, "192.168.10.0"
-	if c.Validate() == nil {
-		t.Error("a bare address: no error")
+	c = ok()
+	c.Domain, c.Domains.Discover = u32(138), false
+	if err := c.Validate(); err != nil || fmt.Sprint(c.active()) != "[138]" {
+		t.Errorf("domain: 138 alone: %v %v", err, c.active())
 	}
 }

@@ -66,22 +66,23 @@ func (s *state) isLocal(p rtps.GUIDPrefix) bool {
 	return ok
 }
 
-// trafficMetrics is what each local writer has written, as cumulative sums
-// since it was first seen, and the packets the capture dropped since it
-// began.
-func trafficMetrics(at, began time.Time, ws []writerTraffic, drops uint64, ros bool) pmetric.Metrics {
-	md, ms := newMetrics()
+func counter(ms pmetric.MetricSlice, name, desc, unit string) pmetric.NumberDataPointSlice {
+	m := ms.AppendEmpty()
+	m.SetName(name)
+	m.SetDescription(desc)
+	m.SetUnit(unit)
+	s := m.SetEmptySum()
+	s.SetIsMonotonic(true)
+	s.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	return s.DataPoints()
+}
+
+// trafficMetrics is what each local writer of a domain has written, as
+// cumulative sums since it was first seen.
+func trafficMetrics(res resource, at time.Time, ws []writerTraffic, ros bool) pmetric.Metrics {
+	md, ms := newMetrics(res)
 	ts := pcommon.NewTimestampFromTime(at)
-	sum := func(name, desc, unit string) pmetric.NumberDataPointSlice {
-		m := ms.AppendEmpty()
-		m.SetName(name)
-		m.SetDescription(desc)
-		m.SetUnit(unit)
-		s := m.SetEmptySum()
-		s.SetIsMonotonic(true)
-		s.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		return s.DataPoints()
-	}
+	sum := func(name, desc, unit string) pmetric.NumberDataPointSlice { return counter(ms, name, desc, unit) }
 	samples := sum(mWriterSamples, "Samples the writer has written since it was first seen, by its sequence numbers.", "{sample}")
 	bytes := sum(mWriterBytes, "Serialized bytes of those samples; samples whose size was not seen are counted at the average.", "By")
 	requests := sum(mWriterRetransmit, "What readers asked the writer to send again: samples (ACKNACK) and fragments (NACK_FRAG).", "{request}")
@@ -114,9 +115,16 @@ func trafficMetrics(at, began time.Time, ws []writerTraffic, drops uint64, ros b
 		point(requests, w.RetransmitRequests).PutStr(attrRequestKind, "sample")
 		point(requests, w.FragmentRequests).PutStr(attrRequestKind, "fragment")
 	}
-	dp := sum(mCaptureDrops, "Packets the kernel dropped before the capture read them. Sample counts survive drops; bytes and requests may be undercounted.", "{packet}").AppendEmpty()
+	return md
+}
+
+// dropsMetrics is the packets the capture dropped since it began: of the
+// receiver, not of a domain.
+func dropsMetrics(at, began time.Time, drops uint64) pmetric.Metrics {
+	md, ms := newMetrics(resource{})
+	dp := counter(ms, mCaptureDrops, "Packets the kernel dropped before the capture read them. Sample counts survive drops; bytes and requests may be undercounted.", "{packet}").AppendEmpty()
 	dp.SetStartTimestamp(pcommon.NewTimestampFromTime(began))
-	dp.SetTimestamp(ts)
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(at))
 	dp.SetIntValue(int64(drops))
 	return md
 }
