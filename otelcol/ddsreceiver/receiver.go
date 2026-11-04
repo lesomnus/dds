@@ -39,9 +39,11 @@ type ddsReceiver struct {
 	done   chan struct{}
 
 	// The traffic; nil when off, or when it could not be captured.
-	stats   *traffic.Stats
-	capture capturer
-	began   time.Time
+	stats       *traffic.Stats
+	captureCfg  traffic.CaptureConfig
+	began       time.Time
+	drops       uint64 // by the sampling goroutine
+	trafficDone chan struct{}
 
 	// newParticipant is participant.New; tests replace it.
 	newParticipant func(participant.Config, func(discovery.Event)) (runner, error)
@@ -183,15 +185,9 @@ func (r *ddsReceiver) start() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	if r.capture != nil {
-		c, stats := r.capture, r.stats
-		go func() {
-			err := c.Run(ctx, func(p traffic.Packet) { stats.Observe(p.Message, p.At) })
-			if err != nil && !errors.Is(err, context.Canceled) {
-				r.logger.Error("capture stopped", zap.Error(err))
-			}
-			_ = c.Close()
-		}()
+	if r.stats != nil {
+		r.trafficDone = make(chan struct{})
+		go r.sampleTraffic(ctx)
 	}
 	go r.send(ctx)
 	go func() {
@@ -219,25 +215,102 @@ func (r *ddsReceiver) openTraffic(ifi *net.Interface) {
 			}
 		}
 	}
-	c, err := r.openCapture(traffic.CaptureConfig{Interfaces: names})
+	cfg := traffic.CaptureConfig{Interfaces: names, Buffer: captureBuffer}
+	// Opened once now to know it can be; then for each window.
+	c, err := r.openCapture(cfg)
 	if err != nil {
 		r.logger.Warn("no traffic metrics: the traffic cannot be captured", zap.Error(err))
 		return
 	}
-	r.capture, r.stats, r.began = c, traffic.NewStats(), r.now()
-	r.logger.Info("capturing the RTPS traffic", zap.Strings("interfaces", names))
+	_ = c.Close()
+	r.captureCfg, r.stats, r.began = cfg, traffic.NewStats(), r.now()
+	r.logger.Info("capturing the RTPS traffic",
+		zap.Strings("interfaces", names),
+		zap.Duration("window", r.cfg.Traffic.Window),
+		zap.Duration("every", r.cfg.Traffic.CollectionInterval))
+}
+
+// captureBuffer is a capture's receive buffer. The kernel charges a queued
+// packet at its size, not at the bytes the filter keeps: a burst of large
+// samples on the loopback fills a small one at once.
+const captureBuffer = 32 << 20
+
+// sampleTraffic captures the traffic a window long every collection
+// interval, and reports it. Between windows the capture is closed: the
+// kernel hands it nothing, and it costs nothing. Counting by sequence
+// numbers, seeing a writer now and then is enough to know how much it
+// wrote. A window as long as the interval captures all along.
+func (r *ddsReceiver) sampleTraffic(ctx context.Context) {
+	defer close(r.trafficDone)
+	every, window := r.cfg.Traffic.CollectionInterval, r.cfg.Traffic.Window
+	observe := func(p traffic.Packet) { r.stats.Observe(p.Message, p.At) }
+	t := time.NewTicker(every)
+	defer t.Stop()
+	if window >= every {
+		c, err := r.openCapture(r.captureCfg)
+		if err != nil {
+			r.logger.Error("capture failed", zap.Error(err))
+			return
+		}
+		defer c.Close()
+		go func() {
+			if err := c.Run(ctx, observe); err != nil && !errors.Is(err, context.Canceled) {
+				r.logger.Error("capture stopped", zap.Error(err))
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				r.drops = c.Drops()
+				r.sendTraffic(ctx)
+			}
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		c, err := r.openCapture(r.captureCfg)
+		if err != nil {
+			r.logger.Warn("capture failed this window", zap.Error(err))
+			continue
+		}
+		wctx, cancel := context.WithTimeout(ctx, window)
+		err = c.Run(wctx, observe)
+		cancel()
+		r.drops += c.Drops()
+		_ = c.Close()
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			r.logger.Warn("capture stopped this window", zap.Error(err))
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		r.sendTraffic(ctx)
+	}
 }
 
 func (r *ddsReceiver) shutdown(ctx context.Context) (bool, error) {
 	r.mu.Lock()
 	r.starts--
 	last := r.starts <= 0
-	cancel, done := r.cancel, r.done
+	cancel, done, trafficDone := r.cancel, r.done, r.trafficDone
 	r.mu.Unlock()
 	if !last || cancel == nil {
 		return last, nil
 	}
 	cancel()
+	if trafficDone != nil {
+		select {
+		case <-trafficDone:
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
+	}
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -263,13 +336,6 @@ func (r *ddsReceiver) send(ctx context.Context) {
 	snap := time.NewTicker(r.cfg.SnapshotInterval)
 	defer flush.Stop()
 	defer snap.Stop()
-
-	var tick <-chan time.Time
-	if r.stats != nil {
-		t := time.NewTicker(r.cfg.Traffic.CollectionInterval)
-		defer t.Stop()
-		tick = t.C
-	}
 
 	ld, rs := newLogs()
 	push := func() {
@@ -307,8 +373,6 @@ func (r *ddsReceiver) send(ctx context.Context) {
 					r.logger.Debug("metrics not consumed", zap.Error(err))
 				}
 			}
-		case <-tick:
-			r.sendTraffic(ctx)
 		}
 	}
 }
@@ -329,7 +393,7 @@ func (r *ddsReceiver) sendTraffic(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	if err := m.ConsumeMetrics(ctx, trafficMetrics(now, r.began, r.state.localWriters(ws), r.capture.Drops(), r.cfg.ROS)); err != nil {
+	if err := m.ConsumeMetrics(ctx, trafficMetrics(now, r.began, r.state.localWriters(ws), r.drops, r.cfg.ROS)); err != nil {
 		r.logger.Debug("metrics not consumed", zap.Error(err))
 	}
 }

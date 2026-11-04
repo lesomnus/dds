@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -303,9 +304,12 @@ func TestTheReceiverIsSharedAndReports(t *testing.T) {
 		discovery.ParticipantDiscovered{Participant: talker},
 		discovery.EndpointDiscovered{Endpoint: chatter},
 	}}
+	var openedMu sync.Mutex
 	var opened traffic.CaptureConfig
 	r.openCapture = func(c traffic.CaptureConfig) (capturer, error) {
+		openedMu.Lock()
 		opened = c
+		openedMu.Unlock()
 		return &fakeCapture{packets: [][]byte{chatterData(prefix, 1), chatterData(prefix, 4)}}, nil
 	}
 	runs := 0
@@ -328,8 +332,11 @@ func TestTheReceiverIsSharedAndReports(t *testing.T) {
 	if len(fake.subs) != 1 || fake.subs[0].Topic != ros2.DiscoveryTopic {
 		t.Fatalf("subscriptions %+v", fake.subs)
 	}
-	if len(opened.Interfaces) == 0 || opened.Interfaces[0] != "lo" {
-		t.Errorf("captures on %v, want the DDS interface (lo here) first", opened.Interfaces)
+	openedMu.Lock()
+	ifs := opened.Interfaces
+	openedMu.Unlock()
+	if len(ifs) == 0 || ifs[0] != "lo" {
+		t.Errorf("captures on %v, want the DDS interface (lo here) first", ifs)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -374,6 +381,90 @@ func TestTheReceiverIsSharedAndReports(t *testing.T) {
 	}
 	_ = pcommon.NewMap
 }
+
+// TestTrafficInWindows: with a window shorter than the interval, the
+// capture is opened for each window and closed after; writers are counted
+// across windows by their sequence numbers.
+func TestTrafficInWindows(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	cfg.Interface = "127.0.0.0/8"
+	cfg.ProcRoot = t.TempDir()
+	cfg.Traffic.CollectionInterval = 100 * time.Millisecond
+	cfg.Traffic.Window = 20 * time.Millisecond
+	set := receivertest.NewNopSettings(f.Type())
+	set.ID = component.NewIDWithName(f.Type(), t.Name())
+	metrics := new(consumertest.MetricsSink)
+	mr, err := f.CreateMetrics(context.Background(), set, cfg, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := mr.(handle).r
+	var mu sync.Mutex
+	opens, open := 0, 0
+	var sn rtps.SequenceNumber
+	r.openCapture = func(traffic.CaptureConfig) (capturer, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		opens++
+		open++
+		// Each window sees the writer once, ten samples on.
+		sn += 10
+		return &windowCapture{packets: [][]byte{chatterData(prefix, sn)}, closed: func() { mu.Lock(); open--; mu.Unlock() }}, nil
+	}
+	r.newParticipant = func(c participant.Config, ev func(discovery.Event)) (runner, error) {
+		return &fakeParticipant{events: ev, replay: []discovery.Event{
+			discovery.ParticipantDiscovered{Participant: talker},
+			discovery.EndpointDiscovered{Endpoint: chatter},
+		}}, nil
+	}
+	if err := mr.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	samples := int64(0)
+	for samples < 30 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d samples counted", samples)
+		}
+		time.Sleep(20 * time.Millisecond)
+		for _, md := range metrics.AllMetrics() {
+			ms := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+			for i := range ms.Len() {
+				if ms.At(i).Name() == mWriterSamples && ms.At(i).Sum().DataPoints().Len() > 0 {
+					samples = max(samples, ms.At(i).Sum().DataPoints().At(0).IntValue())
+				}
+			}
+		}
+	}
+	if err := mr.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if opens < 4 {
+		t.Errorf("opened %d times", opens)
+	}
+	if open != 0 {
+		t.Errorf("%d captures left open", open)
+	}
+}
+
+// windowCapture is a capture that sees its packets, until its window ends.
+type windowCapture struct {
+	packets [][]byte
+	closed  func()
+}
+
+func (w *windowCapture) Run(ctx context.Context, fn func(traffic.Packet)) error {
+	for _, p := range w.packets {
+		fn(traffic.Packet{Message: p, At: time.Now()})
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (w *windowCapture) Drops() uint64 { return 1 }
+func (w *windowCapture) Close() error  { w.closed(); return nil }
 
 func TestNoCaptureNoTraffic(t *testing.T) {
 	f := NewFactory()

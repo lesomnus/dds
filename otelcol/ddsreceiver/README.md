@@ -20,7 +20,8 @@ receivers:
     proc_root: /proc             # the host's /proc (the default; pid_mode and network_mode host)
     traffic:
       enabled: true              # (the default) needs CAP_NET_RAW; without it, no traffic metrics
-      collection_interval: 10s   # (the default)
+      collection_interval: 5s    # (the default) capture this often, and report
+      window: 250ms              # (the default) for this long; as long as the interval: all along
       # interfaces: [eth0, lo]   # default: the DDS interface and loopback
 ```
 
@@ -83,8 +84,17 @@ Every `snapshot_interval`, as gauges:
 | `dds.qos.incompatible_pairs` | reader/writer pairs on a topic where the reader asks for more reliability or durability than the writer offers |
 | `ros.nodes` | ROS nodes (with `ros`) |
 
-Every `traffic.collection_interval`, for each writer of this host's
-participants. These are cumulative counters since the writer was first seen:
+Every `traffic.collection_interval` the traffic is captured for a `window`,
+and the capture is closed between windows. A packet socket costs per packet
+only while it is open, so outside the windows capturing costs nothing (by
+default, 5% of the time). Writers are counted by sequence number, so a writer
+seen in some windows is still counted whole. A writer slower than one sample a
+window is seen in some windows and not others: its count is exact over time,
+and lumpy over a single interval. Sizes and retransmit requests are what the
+windows saw: samples.
+
+For each writer of this host's participants, these are cumulative counters
+since the writer was first seen:
 
 | | |
 |---|---|
