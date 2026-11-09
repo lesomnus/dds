@@ -2,5 +2,21 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "postUpdateOptions": [
+    "gomodTidyAll"
+  ],
+  "packageRules": [
+    {
+      "description": "Keep Collector stable and experimental modules on the same release",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "go.opentelemetry.io/collector",
+        "go.opentelemetry.io/collector/**"
+      ],
+      "groupName": "OpenTelemetry Collector"
+    }
   ]
 }
