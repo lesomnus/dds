@@ -3,7 +3,7 @@ module github.com/lesomnus/dds/otelcol/ddsreceiver
 go 1.26.0
 
 require (
-	github.com/lesomnus/dds v0.0.0-20261109084247-6b02fb89c09d
+	github.com/lesomnus/dds v0.0.0-20261109140610-b13625d8727b
 	go.opentelemetry.io/collector/component v1.71.0
 	go.opentelemetry.io/collector/component/componenttest v0.165.0
 	go.opentelemetry.io/collector/consumer v1.71.0
